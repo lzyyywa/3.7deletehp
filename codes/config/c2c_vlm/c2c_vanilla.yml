@@ -80,3 +80,7 @@ test:
   bias: 0.001
   pretrain: False
   load_model:  YOUR_PATH
+  
+w_cls: 1.0   #动词/物品分类损失权重
+w_dal: 1.0   #判别对齐损失权重
+w_hem: 1.0   #层次蕴含
