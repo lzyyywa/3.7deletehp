@@ -24,7 +24,7 @@ text:
 data:
   dataset: sth-com
   #set as your own path
-  dataset_path: "/data/Disk_B/action_data/SS_data/somethingv2/20bn-something-something-v2-frames/"
+  dataset_path: "/opt/data/share/101012/data/sth-else/frames/"
   num_frames: 8
   num_workers: 4
 
