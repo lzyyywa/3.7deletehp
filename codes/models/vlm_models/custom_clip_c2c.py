@@ -6,8 +6,8 @@ from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
 
-# 引入第一步部署的双曲基础算子
-from utils.lorentz import expmap0 
+# 引入底层 D 维接口的双曲基础算子
+from utils.lorentz import exp_map0, pairwise_dist
 
 _tokenizer = _Tokenizer()
 
@@ -115,20 +115,15 @@ class CustomCLIP(nn.Module):
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
         self.logit_scale = clip_model.logit_scale
-        self.token_embedding = clip_model.token_embedding  # 提取原始 embedding 层供粗粒度使用
+        self.token_embedding = clip_model.token_embedding 
 
-        # ------------ 新增：粗粒度文本预处理与 Token化 ------------
+        # 粗粒度文本预处理与 Token化
         self.coarse_attrs = train_dataset.coarse_attrs
         self.coarse_objs = train_dataset.coarse_objs
-        
-        # 构造标准的 CLIP prompt
         coarse_verb_prompts = [f"a video of a person {c}" for c in self.coarse_attrs]
         coarse_obj_prompts = [f"a video of a {c}" for c in self.coarse_objs]
-        
-        # 将 Token 注册为 buffer，避免设备不对齐
         self.register_buffer('coarse_verb_tokens', clip.tokenize(coarse_verb_prompts))
         self.register_buffer('coarse_obj_tokens', clip.tokenize(coarse_obj_prompts))
-        # ---------------------------------------------------------
 
         # Independent Learning Modules
         try:
@@ -145,15 +140,12 @@ class CustomCLIP(nn.Module):
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        # ------------ 新增：双曲空间映射参数 ------------
+        # 双曲空间映射参数
         self.c = nn.Parameter(torch.tensor([1.0]))
         self.visual_scale = nn.Parameter(torch.tensor([0.1]))
         self.text_scale = nn.Parameter(torch.tensor([0.1]))
-        # ------------------------------------------------
 
-    # 修改前向传播签名，强制接收批次对应的文本标签索引
     def forward(self, video, batch_verb=None, batch_obj=None, batch_coarse_verb=None, batch_coarse_obj=None, pairs=None):
-        device = video.device
         
         # 1. Fine-grained Text Features
         verb_prompts = self.verb_prompt_learner()
@@ -164,8 +156,7 @@ class CustomCLIP(nn.Module):
         obj_text_features = self.text_encoder(obj_prompts, self.obj_tokenized_prompts)
         obj_text_features = self.c2c_text_o(obj_text_features)
 
-        # 2. Coarse-grained Text Features (新增数据流)
-        # 用原生的 Token Embedding 获取输入，然后过定制的 text_encoder
+        # 2. Coarse-grained Text Features
         with torch.no_grad():
             c_v_emb = self.token_embedding(self.coarse_verb_tokens).type(self.text_encoder.dtype)
             c_o_emb = self.token_embedding(self.coarse_obj_tokens).type(self.text_encoder.dtype)
@@ -173,7 +164,6 @@ class CustomCLIP(nn.Module):
         coarse_verb_features = self.text_encoder(c_v_emb, self.coarse_verb_tokens)
         coarse_obj_features = self.text_encoder(c_o_emb, self.coarse_obj_tokens)
         
-        # 保持空间一致性，过同一个线性映射层
         coarse_verb_features = self.c2c_text_v(coarse_verb_features)
         coarse_obj_features = self.c2c_text_o(coarse_obj_features)
 
@@ -183,10 +173,10 @@ class CustomCLIP(nn.Module):
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        # ------------ 严格的欧式到双曲 (Lorentz) 映射 ------------
+        # ------------ 严格对齐 lorentz.py 的纯空间 (D维) 映射 ------------
         c_pos = F.softplus(self.c)
 
-        # L2 归一化并缩放
+        # 仅做 L2 归一化和缩放，严禁补 0 升维
         o_feat_norm = F.normalize(o_feat, p=2, dim=-1) * self.visual_scale
         v_feat_norm = F.normalize(v_feat, p=2, dim=-1) * self.visual_scale
         
@@ -196,44 +186,31 @@ class CustomCLIP(nn.Module):
         coarse_verb_norm = F.normalize(coarse_verb_features, p=2, dim=-1) * self.text_scale
         coarse_obj_norm = F.normalize(coarse_obj_features, p=2, dim=-1) * self.text_scale
 
-        # 补 0 升维
-        def to_lorentz_u(x):
-            return torch.cat([torch.zeros(x.shape[0], 1, device=device), x], dim=-1)
-
-        # 执行 expmap0
-        o_hyp = expmap0(to_lorentz_u(o_feat_norm), c=c_pos)
-        v_hyp = expmap0(to_lorentz_u(v_feat_norm), c=c_pos)
+        # 执行内置的 exp_map0，返回值依然是 D 维
+        o_hyp = exp_map0(o_feat_norm, curv=c_pos)
+        v_hyp = exp_map0(v_feat_norm, curv=c_pos)
         
-        t_v_hyp_all = expmap0(to_lorentz_u(verb_text_norm), c=c_pos)
-        t_o_hyp_all = expmap0(to_lorentz_u(obj_text_norm), c=c_pos)
+        t_v_hyp_all = exp_map0(verb_text_norm, curv=c_pos)
+        t_o_hyp_all = exp_map0(obj_text_norm, curv=c_pos)
         
-        coarse_v_hyp_all = expmap0(to_lorentz_u(coarse_verb_norm), c=c_pos)
-        coarse_o_hyp_all = expmap0(to_lorentz_u(coarse_obj_norm), c=c_pos)
+        coarse_v_hyp_all = exp_map0(coarse_verb_norm, curv=c_pos)
+        coarse_o_hyp_all = exp_map0(coarse_obj_norm, curv=c_pos)
 
-        # 4. 基础分类 Logits：洛伦兹内积与双曲距离
-        def lorentz_inner(x, y):
-            # x: [B, D+1], y: [N, D+1] -> return: [B, N]
-            return -torch.matmul(x[:, 0:1], y[:, 0:1].t()) + torch.matmul(x[:, 1:], y[:, 1:].t())
-
-        verb_inner = lorentz_inner(v_hyp, t_v_hyp_all)
-        obj_inner = lorentz_inner(o_hyp, t_o_hyp_all)
-
-        verb_dist = torch.acosh(torch.clamp(-verb_inner / c_pos, min=1.0 + 1e-5)) * torch.sqrt(c_pos)
-        obj_dist = torch.acosh(torch.clamp(-obj_inner / c_pos, min=1.0 + 1e-5)) * torch.sqrt(c_pos)
+        # 4. 基础分类 Logits：调用 lorentz.py 的批量距离计算
+        verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_pos)
+        obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_pos)
 
         verb_logits = torch.exp(-verb_dist)
         obj_logits = torch.exp(-obj_dist)
         pred_com = torch.einsum('bi,bj->bij', verb_logits, obj_logits)
 
-        # ------------ 训练与测试的返回分流 ------------
+        # ------------ 训练与测试返回分流 ------------
         if self.training:
-            # 根据当前 batch 挑选对应的正样本对用于双曲蕴含锥计算
             t_v_hyp_batch = t_v_hyp_all[batch_verb]
             t_o_hyp_batch = t_o_hyp_all[batch_obj]
             coarse_v_hyp_batch = coarse_v_hyp_all[batch_coarse_verb]
             coarse_o_hyp_batch = coarse_o_hyp_all[batch_coarse_obj]
 
-            # 必须返回字典以打通 loss_calu 数据流
             predict = {
                 'c_pos': c_pos,
                 'verb_logits': verb_logits,
