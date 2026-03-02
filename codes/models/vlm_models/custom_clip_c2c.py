@@ -6,6 +6,9 @@ from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
 
+# 引入第一步部署的双曲基础算子
+from utils.lorentz import expmap0 
+
 _tokenizer = _Tokenizer()
 
 
@@ -133,7 +136,14 @@ class CustomCLIP(nn.Module):
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        # NOTE: Condition modules (OE2, VE2, condition_module) are removed for ablation.
+        # ------------ 新增：双曲空间映射参数 ------------
+        # 曲率 c：可学习参数，初始化为 1.0
+        self.c = nn.Parameter(torch.tensor([1.0]))
+        
+        # 缩放因子：分别控制视觉和文本特征投影前的模长，初始化为 0.1 防止 NaN
+        self.visual_scale = nn.Parameter(torch.tensor([0.1]))
+        self.text_scale = nn.Parameter(torch.tensor([0.1]))
+        # ------------------------------------------------
 
     def forward(self, video, pairs=None):
         # 1. Text Features
@@ -150,28 +160,54 @@ class CustomCLIP(nn.Module):
 
         # 3. Independent Learning
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))
-        o_feat_normed = F.normalize(o_feat, dim=1)
-
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
-        v_feat_normed = F.normalize(v_feat, dim=1)
 
-        verb_text_features_norm = F.normalize(verb_text_features, dim=-1)
-        obj_text_features_norm = F.normalize(obj_text_features, dim=-1)
+        # ------------ 新增：欧式到双曲 (Lorentz) 的严格映射 ------------
+        # 确保曲率严格为正
+        c_pos = F.softplus(self.c)
 
-        # 4. Logits
-        verb_logits = v_feat_normed @ verb_text_features_norm.t()
-        obj_logits = o_feat_normed @ obj_text_features_norm.t()
+        # L2 归一化并乘以可学习的缩放因子
+        o_feat_norm = F.normalize(o_feat, p=2, dim=-1) * self.visual_scale
+        v_feat_norm = F.normalize(v_feat, p=2, dim=-1) * self.visual_scale
+        verb_text_norm = F.normalize(verb_text_features, p=2, dim=-1) * self.text_scale
+        obj_text_norm = F.normalize(obj_text_features, p=2, dim=-1) * self.text_scale
 
-        verb_logits = verb_logits * 0.5 + 0.5
-        obj_logits = obj_logits * 0.5 + 0.5
+        # 升维：在第 0 维拼接时间维 0，使其符合 Lorentz 模型的 u = [0, x] 定义
+        u_o = torch.cat([torch.zeros(o_feat_norm.shape[0], 1, device=o_feat.device), o_feat_norm], dim=-1)
+        u_v = torch.cat([torch.zeros(v_feat_norm.shape[0], 1, device=v_feat.device), v_feat_norm], dim=-1)
+        u_t_v = torch.cat([torch.zeros(verb_text_norm.shape[0], 1, device=verb_text_features.device), verb_text_norm], dim=-1)
+        u_t_o = torch.cat([torch.zeros(obj_text_norm.shape[0], 1, device=obj_text_features.device), obj_text_norm], dim=-1)
+
+        # 指数映射到双曲流形内部
+        o_hyp = expmap0(u_o, c=c_pos)
+        v_hyp = expmap0(u_v, c=c_pos)
+        t_v_hyp = expmap0(u_t_v, c=c_pos)
+        t_o_hyp = expmap0(u_t_o, c=c_pos)
+        # ---------------------------------------------------------------
+
+        # 4. Logits 计算改造：使用双曲距离替代欧式点积
+        # 定义 Lorentz 内积
+        def lorentz_inner(x, y):
+            # x: [B, D+1], y: [N, D+1] -> return: [B, N]
+            return -torch.matmul(x[:, 0:1], y[:, 0:1].t()) + torch.matmul(x[:, 1:], y[:, 1:].t())
+
+        verb_inner = lorentz_inner(v_hyp, t_v_hyp)
+        obj_inner = lorentz_inner(o_hyp, t_o_hyp)
+
+        # 计算双曲距离 d = arccosh(-inner / c) * sqrt(c)
+        verb_dist = torch.acosh(torch.clamp(-verb_inner / c_pos, min=1.0 + 1e-5)) * torch.sqrt(c_pos)
+        obj_dist = torch.acosh(torch.clamp(-obj_inner / c_pos, min=1.0 + 1e-5)) * torch.sqrt(c_pos)
+
+        # 将双曲距离转化为相似度分数 (使用 exp(-dist) 将距离映射到 0~1 区间)
+        verb_logits = torch.exp(-verb_dist)
+        obj_logits = torch.exp(-obj_dist)
 
         # 5. Simple Composition (Product of probabilities)
-        # Shape: [Batch, N_verb, N_obj]
         pred_com = torch.einsum('bi,bj->bij', verb_logits, obj_logits)
 
         if self.training:
-            # Return 3 values: verb scores, object scores, composition matrix
+            # 训练阶段保留原有的返回值结构，确保外部代码暂不崩溃
             return verb_logits, obj_logits, pred_com
         else:
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
@@ -200,7 +236,6 @@ def build_model(train_dataset, cfg):
     model = CustomCLIP(cfg, train_dataset, clip_model)
 
     print("Turning off gradients in both the image and the text encoder")
-    # 恢复原有的精细化梯度控制逻辑
     for name, param in model.named_parameters():
         param.requires_grad_(False)
         if "prompt_learner" in name:
@@ -223,7 +258,8 @@ def build_model(train_dataset, cfg):
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
                 print(f'{name}: {param.requires_grad}')
-        elif 'c2c' in name:
+        # 确保新加入的双曲映射参数 (c, scale) 开启梯度
+        elif 'c2c' in name or name in ['c', 'visual_scale', 'text_scale']:
             param.requires_grad = True
             print(f'{name}: {param.requires_grad}')
     return model
