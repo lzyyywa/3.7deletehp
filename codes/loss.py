@@ -98,7 +98,7 @@ def loss_calu(predict, target, config):
         'loss_hem': loss_hem.item()
     }
 
-    return total_loss
+    return total_loss,loss_dict
 
 class KLLoss(nn.Module):
     def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
