@@ -122,16 +122,15 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         )
 
         epoch_train_losses = []
-        epoch_com_losses = []
-        epoch_oo_losses = []
-        epoch_vv_losses = []
+        # ====== 新增：更细致的损失监控列表 ======
+        epoch_cls_v_losses = []
+        epoch_cls_o_losses = []
+        epoch_dal_losses = []
+        epoch_hem_losses = []
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
         for bid, batch in enumerate(train_dataloader):
-            # ---------------------------------------------------------
-            # 新版数据解包：严格获取 6 个特征 (包含双曲层次所需的粗粒度标签)
-            # ---------------------------------------------------------
             batch_img = batch[0].cuda()
             batch_verb = batch[1].cuda()
             batch_obj = batch[2].cuda()
@@ -139,13 +138,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             batch_coarse_verb = batch[4].cuda()
             batch_coarse_obj = batch[5].cuda()
 
-            # 打包给 loss_calu
             target = [batch_img, batch_verb, batch_obj, batch_target, batch_coarse_verb, batch_coarse_obj]
 
             with torch.cuda.amp.autocast(enabled=True):
-                # ---------------------------------------------------------
-                # 新版模型调用：使用 kwargs 传参，获取 predict 字典
-                # ---------------------------------------------------------
                 predict = model(
                     video=batch_img,
                     batch_verb=batch_verb,
@@ -155,41 +150,57 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     pairs=batch_target
                 )
 
-                # ---------------------------------------------------------
-                # 新版损失计算：直接进入我们重写好的 loss_calu
-                # ---------------------------------------------------------
-                loss = loss_calu(predict, target, config)
+                # ====== 修改：接收 total_loss 和 loss_dict ======
+                loss, loss_dict = loss_calu(predict, target, config)
                 loss = loss / config.gradient_accumulation_steps
 
-            # 梯度回传与优化器更新
             scaler.scale(loss).backward()
 
             if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
-                scaler.unscale_(optimizer) 
+                scaler.unscale_(optimizer)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
 
+            # 记录总损失和各个子损失
             epoch_train_losses.append(loss.item() * config.gradient_accumulation_steps)
+            epoch_cls_v_losses.append(loss_dict['loss_cls_verb'])
+            epoch_cls_o_losses.append(loss_dict['loss_cls_obj'])
+            epoch_dal_losses.append(loss_dict['loss_dal'])
+            epoch_hem_losses.append(loss_dict['loss_hem'])
 
-            # 占位记录，防止原版日志打印代码报错
-            epoch_com_losses.append(0.0)
-            epoch_vv_losses.append(0.0)
-            epoch_oo_losses.append(0.0)
+            # ====== 新增：提取底层的曲率 c 和 温度 tau ======
+            current_c = predict['c_pos'].item()
+            if hasattr(model, 'module'): # 兼容多卡
+                current_temp = F.softplus(model.module.cls_temp).item() + 0.01
+            else:
+                current_temp = F.softplus(model.cls_temp).item() + 0.01
 
-            progress_bar.set_postfix({"train loss": np.mean(epoch_train_losses[-50:])})
+            # ====== 修改：进度条实时显示所有关键指标（取最近50个batch的平滑平均值） ======
+            progress_bar.set_postfix({
+                "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
+                "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
+                "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
+                "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
+                "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
+                "c": f"{current_c:.3f}", 
+                "tau": f"{current_temp:.3f}"
+            })
             progress_bar.update()
 
         lr_scheduler.step()
         progress_bar.close()
-        progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}")
+        
+        # 打印并写入到 log.txt
+        progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}")
         train_losses.append(np.mean(epoch_train_losses))
+        
         log_training.write('\n')
-        log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses)}\n")
-
-        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses)}\n")
-        log_training.write(f"epoch {i + 1} vv loss {np.mean(epoch_vv_losses)}\n")
-        log_training.write(f"epoch {i + 1} oo loss {np.mean(epoch_oo_losses)}\n")
+        log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
+        log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
+        log_training.write(f"epoch {i + 1} cls_obj loss {np.mean(epoch_cls_o_losses):.4f}\n")
+        log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
+        log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
 
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({
