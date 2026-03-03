@@ -10,6 +10,13 @@ from utils.lorentz import exp_map0, pairwise_dist
 
 _tokenizer = _Tokenizer()
 
+# [核心抢救 1]：防 NaN 梯度断崖的绝对安全截断
+# 限制 min_norm=0.5 确保距离原点足够远，杜绝 arcsin 爆炸
+def safe_norm(x, min_norm=0.5, max_norm=10.0):
+    norm = torch.sqrt(torch.sum(x**2, dim=-1, keepdim=True) + 1e-8)
+    norm_clamped = torch.clamp(norm, min=min_norm, max=max_norm)
+    return x * (norm_clamped / norm)
+
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
         super(MLP, self).__init__()
@@ -134,12 +141,10 @@ class CustomCLIP(nn.Module):
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        self.c = nn.Parameter(torch.tensor([1.0]))
-        # 放大初始 scale，给予网络初始模长空间
-        self.visual_scale = nn.Parameter(torch.tensor([0.2]))
-        self.text_scale = nn.Parameter(torch.tensor([0.2]))
+        self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+        self.visual_scale = nn.Parameter(torch.tensor([1.0]))
+        self.text_scale = nn.Parameter(torch.tensor([1.0]))
         
-        # 专属双曲分类温度系数，废弃 CLIP 原有的 100 倍暴利放大
         self.cls_temp = nn.Parameter(torch.tensor([0.07]))
 
     def forward(self, video, batch_verb=None, batch_obj=None, batch_coarse_verb=None, batch_coarse_obj=None, pairs=None):
@@ -168,14 +173,17 @@ class CustomCLIP(nn.Module):
 
         c_pos = F.softplus(self.c)
 
-        # 【核心修正 1】：绝对禁止使用 F.normalize()，保留原生地自由范数！
-        # 使得网络真正能够在双曲空间拉开层级差距 (半径差异)
-        o_feat_norm = o_feat * self.visual_scale
-        v_feat_norm = v_feat * self.visual_scale
-        verb_text_norm = verb_text_features * self.text_scale
-        obj_text_norm = obj_text_features * self.text_scale
-        coarse_verb_norm = coarse_verb_features * self.text_scale
-        coarse_obj_norm = coarse_obj_features * self.text_scale
+        o_feat_norm = safe_norm(o_feat * self.visual_scale)
+        v_feat_norm = safe_norm(v_feat * self.visual_scale)
+        verb_text_norm = safe_norm(verb_text_features * self.text_scale)
+        obj_text_norm = safe_norm(obj_text_features * self.text_scale)
+        coarse_verb_norm = safe_norm(coarse_verb_features * self.text_scale)
+        coarse_obj_norm = safe_norm(coarse_obj_features * self.text_scale)
+
+        if self.training:
+            # [核心抢救 2]：微小抖动，杜绝视频和文本在双曲空间完全重合导致的 0/0 奇点
+            o_feat_norm = o_feat_norm + torch.randn_like(o_feat_norm) * 1e-4
+            v_feat_norm = v_feat_norm + torch.randn_like(v_feat_norm) * 1e-4
 
         o_hyp = exp_map0(o_feat_norm, curv=c_pos)
         v_hyp = exp_map0(v_feat_norm, curv=c_pos)
@@ -187,8 +195,8 @@ class CustomCLIP(nn.Module):
         verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_pos)
         obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_pos)
 
-        # 【核心修正 2】：使用专属稳定温度系数转为 Logits
-        temp = torch.clamp(self.cls_temp, min=0.01)
+        # 温度系数软约束，永不为负或零
+        temp = F.softplus(self.cls_temp) + 0.05
         verb_logits = -verb_dist / temp
         obj_logits = -obj_dist / temp
 
@@ -211,9 +219,10 @@ class CustomCLIP(nn.Module):
             }
             return predict
         else:
-            # 【核心修正 3】：直接使用 Logits 相加，代替之前的概率相乘。
-            # 这不仅严格还原了原基线欧式加法的评估逻辑，也完美兼容了 test.py 的阈值 Bias 遮罩
-            pred_com = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
+            # 严格转为 0~1 的概率分数，完美适配你 test.py 里面 bias=0.001 的评测逻辑
+            verb_prob = torch.softmax(verb_logits, dim=-1)
+            obj_prob = torch.softmax(obj_logits, dim=-1)
+            pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)
             
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = pred_com[:, verb_idx, obj_idx]
@@ -247,6 +256,6 @@ def build_model(train_dataset, cfg):
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
-        elif 'c2c' in name or name in ['c', 'visual_scale', 'text_scale', 'cls_temp']:
+        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp']:
             param.requires_grad = True
     return model
