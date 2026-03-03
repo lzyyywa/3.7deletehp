@@ -113,7 +113,6 @@ class CustomCLIP(nn.Module):
 
         self.text_encoder = TextEncoder(cfg, clip_model)
         self.video_encoder = VideoEncoder(cfg, clip_model)
-        self.logit_scale = clip_model.logit_scale
         self.token_embedding = clip_model.token_embedding 
 
         self.coarse_attrs = train_dataset.coarse_attrs
@@ -136,8 +135,12 @@ class CustomCLIP(nn.Module):
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
         self.c = nn.Parameter(torch.tensor([1.0]))
-        self.visual_scale = nn.Parameter(torch.tensor([0.1]))
-        self.text_scale = nn.Parameter(torch.tensor([0.1]))
+        # 放大初始 scale，给予网络初始模长空间
+        self.visual_scale = nn.Parameter(torch.tensor([0.2]))
+        self.text_scale = nn.Parameter(torch.tensor([0.2]))
+        
+        # 专属双曲分类温度系数，废弃 CLIP 原有的 100 倍暴利放大
+        self.cls_temp = nn.Parameter(torch.tensor([0.07]))
 
     def forward(self, video, batch_verb=None, batch_obj=None, batch_coarse_verb=None, batch_coarse_obj=None, pairs=None):
         verb_prompts = self.verb_prompt_learner()
@@ -165,12 +168,14 @@ class CustomCLIP(nn.Module):
 
         c_pos = F.softplus(self.c)
 
-        o_feat_norm = F.normalize(o_feat, p=2, dim=-1) * self.visual_scale
-        v_feat_norm = F.normalize(v_feat, p=2, dim=-1) * self.visual_scale
-        verb_text_norm = F.normalize(verb_text_features, p=2, dim=-1) * self.text_scale
-        obj_text_norm = F.normalize(obj_text_features, p=2, dim=-1) * self.text_scale
-        coarse_verb_norm = F.normalize(coarse_verb_features, p=2, dim=-1) * self.text_scale
-        coarse_obj_norm = F.normalize(coarse_obj_features, p=2, dim=-1) * self.text_scale
+        # 【核心修正 1】：绝对禁止使用 F.normalize()，保留原生地自由范数！
+        # 使得网络真正能够在双曲空间拉开层级差距 (半径差异)
+        o_feat_norm = o_feat * self.visual_scale
+        v_feat_norm = v_feat * self.visual_scale
+        verb_text_norm = verb_text_features * self.text_scale
+        obj_text_norm = obj_text_features * self.text_scale
+        coarse_verb_norm = coarse_verb_features * self.text_scale
+        coarse_obj_norm = coarse_obj_features * self.text_scale
 
         o_hyp = exp_map0(o_feat_norm, curv=c_pos)
         v_hyp = exp_map0(v_feat_norm, curv=c_pos)
@@ -182,11 +187,10 @@ class CustomCLIP(nn.Module):
         verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_pos)
         obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_pos)
 
-        # 【核心修正1】提取真正的未经 exp() 压扁的放大 Logits 用于交叉熵！
-        # 使用 CLIP 自带的可学习温度系数 scale
-        scale = self.logit_scale.exp()
-        verb_logits = -verb_dist * scale
-        obj_logits = -obj_dist * scale
+        # 【核心修正 2】：使用专属稳定温度系数转为 Logits
+        temp = torch.clamp(self.cls_temp, min=0.01)
+        verb_logits = -verb_dist / temp
+        obj_logits = -obj_dist / temp
 
         if self.training:
             t_v_hyp_batch = t_v_hyp_all[batch_verb]
@@ -207,11 +211,9 @@ class CustomCLIP(nn.Module):
             }
             return predict
         else:
-            # 【核心修正2】在测试时，使用 Softmax 把 logits 转成严格的概率
-            # 这样 test.py 添加 bias=0.001 的逻辑才具有意义，并可做内积组合
-            verb_prob = torch.softmax(verb_logits, dim=-1)
-            obj_prob = torch.softmax(obj_logits, dim=-1)
-            pred_com = torch.einsum('bi,bj->bij', verb_prob, obj_prob)
+            # 【核心修正 3】：直接使用 Logits 相加，代替之前的概率相乘。
+            # 这不仅严格还原了原基线欧式加法的评估逻辑，也完美兼容了 test.py 的阈值 Bias 遮罩
+            pred_com = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
             
             verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
             com_logits = pred_com[:, verb_idx, obj_idx]
@@ -245,6 +247,6 @@ def build_model(train_dataset, cfg):
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
-        elif 'c2c' in name or name in ['c', 'visual_scale', 'text_scale']:
+        elif 'c2c' in name or name in ['c', 'visual_scale', 'text_scale', 'cls_temp']:
             param.requires_grad = True
     return model
