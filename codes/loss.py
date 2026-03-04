@@ -5,16 +5,6 @@ import math
 
 from utils.lorentz import pairwise_dist, half_aperture, oxy_angle
 
-def dist_to_origin(x, c):
-    x_time = torch.sqrt(1.0 / c + torch.sum(x**2, dim=-1, keepdim=True))
-    return torch.acosh(torch.clamp(torch.sqrt(c) * x_time, min=1.0 + 1e-5)) / torch.sqrt(c)
-
-def safe_half_aperture(p, c, K=0.1):
-    d = dist_to_origin(p, c)
-    val = K / torch.clamp(torch.sinh(torch.sqrt(c) * d), min=1e-5)
-    val_clamped = torch.clamp(val, min=-0.9999, max=0.9999)
-    return torch.asin(val_clamped)
-
 class HierarchicalEntailmentLoss(nn.Module):
     def __init__(self, K=0.1):
         super().__init__()
@@ -23,41 +13,36 @@ class HierarchicalEntailmentLoss(nn.Module):
     def forward(self, child, parent, c):
         with torch.cuda.amp.autocast(enabled=False):
             theta = oxy_angle(parent.float(), child.float(), curv=c.float()).unsqueeze(1)               
-            alpha_parent = safe_half_aperture(parent.float(), c.float(), K=self.K).unsqueeze(1)
+            alpha_parent = half_aperture(parent.float(), curv=c.float(), min_radius=self.K).unsqueeze(1) 
             loss_cone = F.relu(theta - alpha_parent)
-            
-        mask = ~torch.isnan(loss_cone)
-        if mask.sum() > 0:
-            return loss_cone[mask].mean()
-        else:
-            return torch.tensor(0.0, device=child.device, requires_grad=True)
+        return loss_cone.mean()
 
 class DiscriminativeAlignmentLoss(nn.Module):
-    # 【终极修正】：恢复硬编码的 0.07 温度，确保模态对齐足够尖锐
     def __init__(self, temperature=0.07, hard_weight=3.0):
         super().__init__()
         self.temperature = temperature
         self.hard_weight = hard_weight
         self.criterion = nn.CrossEntropyLoss()
 
-    def forward(self, v_hyp, t_hyp, c, mask_pos, mask_hard):
+    def forward(self, v_hyp, t_hyp, c, batch_verb, batch_obj):
         with torch.cuda.amp.autocast(enabled=False):
             dist = pairwise_dist(v_hyp.float(), t_hyp.float(), curv=c.float())
             logits = -dist / self.temperature
             
+            B = v_hyp.size(0)
+            mask_verb = (batch_verb.unsqueeze(1) == batch_verb.unsqueeze(0))
+            mask_obj = (batch_obj.unsqueeze(1) == batch_obj.unsqueeze(0))
+    
+            mask_hard = (mask_verb | mask_obj) & ~torch.eye(B, dtype=torch.bool, device=v_hyp.device)
+            
             if self.hard_weight > 1.0:
                 logits = logits + mask_hard.float() * math.log(self.hard_weight)
                 
-            # 屏蔽假负例，防止左右互搏
-            false_negatives = mask_pos & ~torch.eye(v_hyp.size(0), dtype=torch.bool, device=v_hyp.device)
-            logits.masked_fill_(false_negatives, -1e9)
-            
-            labels = torch.arange(v_hyp.size(0), device=v_hyp.device)
+            labels = torch.arange(B, device=v_hyp.device)
             
         loss_v2t = self.criterion(logits, labels)
         loss_t2v = self.criterion(logits.t(), labels)
         return (loss_v2t + loss_t2v) / 2.0
-
 
 def loss_calu(predict, target, config):
     batch_img, batch_verb, batch_obj, batch_pair, batch_coarse_verb, batch_coarse_obj = target
@@ -69,46 +54,51 @@ def loss_calu(predict, target, config):
     obj_logits = predict['obj_logits']
     
     v_hyp = predict['v_hyp']                  
-    o_hyp = predict['o_hyp']                  
+    o_hyp = predict['o_hyp']
+    v_c_hyp = predict['v_c_hyp']              # 获取视觉组合特征 (子)
+    
     t_v_hyp = predict['t_v_hyp']              
-    t_o_hyp = predict['t_o_hyp']              
+    t_o_hyp = predict['t_o_hyp']
+    t_c_hyp = predict['t_c_hyp']              # 获取文本组合特征 (子)
+    
     coarse_v_hyp = predict['coarse_v_hyp']    
     coarse_o_hyp = predict['coarse_o_hyp']    
 
     ce_loss_fn = nn.CrossEntropyLoss()
-    # 恢复 0.07 的 DAL 温度
     dal_loss_fn = DiscriminativeAlignmentLoss(temperature=0.07, hard_weight=3.0)
     hem_loss_fn = HierarchicalEntailmentLoss(K=0.1)
 
     loss_cls_verb = ce_loss_fn(verb_logits, batch_verb)
     loss_cls_obj = ce_loss_fn(obj_logits, batch_obj)
-    
-    mask_verb = (batch_verb.unsqueeze(1) == batch_verb.unsqueeze(0))
-    mask_obj = (batch_obj.unsqueeze(1) == batch_obj.unsqueeze(0))
-    
-    hard_verb = mask_obj & ~mask_verb
-    # 调用时不再需要传入动态 temp
-    loss_dal_verb = dal_loss_fn(v_hyp, t_v_hyp, c_pos, mask_pos=mask_verb, mask_hard=hard_verb)
-    
-    hard_obj = mask_verb & ~mask_obj
-    loss_dal_obj = dal_loss_fn(o_hyp, t_o_hyp, c_pos, mask_pos=mask_obj, mask_hard=hard_obj)
-    
+
+    loss_dal_verb = dal_loss_fn(v_hyp, t_v_hyp, c_pos, batch_verb, batch_obj)
+    loss_dal_obj = dal_loss_fn(o_hyp, t_o_hyp, c_pos, batch_verb, batch_obj)
     loss_dal = loss_dal_verb + loss_dal_obj
 
-    loss_hem_v2fv = hem_loss_fn(child=v_hyp, parent=t_v_hyp, c=c_pos)
-    loss_hem_fv2cv = hem_loss_fn(child=t_v_hyp, parent=coarse_v_hyp, c=c_pos)
-    loss_hem_o2fo = hem_loss_fn(child=o_hyp, parent=t_o_hyp, c=c_pos)
-    loss_hem_fo2co = hem_loss_fn(child=t_o_hyp, parent=coarse_o_hyp, c=c_pos)
-    loss_hem = loss_hem_v2fv + loss_hem_fv2cv + loss_hem_o2fo + loss_hem_fo2co
+    # 【严格对齐论文 Eq 13】：不再做跨模态包含，而是同模态内部包含
+    # 1. 视觉内部概念层级 (Conceptual Hierarchy: v_c \in v_s, v_c \in v_o)
+    loss_hem_vc2vs = hem_loss_fn(child=v_c_hyp, parent=v_hyp, c=c_pos)
+    loss_hem_vc2vo = hem_loss_fn(child=v_c_hyp, parent=o_hyp, c=c_pos)
+    
+    # 2. 文本内部概念层级 (Conceptual Hierarchy: t_c \in t_s, t_c \in t_o)
+    loss_hem_tc2ts = hem_loss_fn(child=t_c_hyp, parent=t_v_hyp, c=c_pos)
+    loss_hem_tc2to = hem_loss_fn(child=t_c_hyp, parent=t_o_hyp, c=c_pos)
 
-    w_cls = getattr(config, 'w_cls', 3.0)
-    w_dal = getattr(config, 'w_dal', 0.5)
-    w_hem = getattr(config, 'w_hem', 0.1)
+    # 3. 文本内部语义层级 (Semantic Hierarchy: t_s \in t_sp, t_o \in t_op)
+    loss_hem_ts2tsp = hem_loss_fn(child=t_v_hyp, parent=coarse_v_hyp, c=c_pos)
+    loss_hem_to2top = hem_loss_fn(child=t_o_hyp, parent=coarse_o_hyp, c=c_pos)
+
+    loss_hem = loss_hem_vc2vs + loss_hem_vc2vo + \
+               loss_hem_tc2ts + loss_hem_tc2to + \
+               loss_hem_ts2tsp + loss_hem_to2top
+
+    w_cls = getattr(config, 'w_cls', 1.0)
+    w_dal = getattr(config, 'w_dal', 1.0)
+    w_hem = getattr(config, 'w_hem', 1.0)
 
     total_loss = w_cls * (loss_cls_verb + loss_cls_obj) + \
                  w_dal * loss_dal + \
                  w_hem * loss_hem
-
     loss_dict = {
         'loss_cls_verb': loss_cls_verb.item(),
         'loss_cls_obj': loss_cls_obj.item(),
@@ -116,7 +106,7 @@ def loss_calu(predict, target, config):
         'loss_hem': loss_hem.item()
     }
 
-    return total_loss, loss_dict
+    return total_loss,loss_dict
 
 class KLLoss(nn.Module):
     def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
