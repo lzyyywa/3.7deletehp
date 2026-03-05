@@ -273,6 +273,6 @@ def build_model(train_dataset, cfg):
         elif 'video_encoder' in name:
             if 'temporal_embedding' in name or 'ln_post' in name or 'Adapter' in name or 'clip_proj' in name:
                 param.requires_grad = True
-        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp']:
+        elif 'c2c' in name or name in ['visual_scale', 'text_scale', 'cls_temp','c']:
             param.requires_grad = True
     return model
