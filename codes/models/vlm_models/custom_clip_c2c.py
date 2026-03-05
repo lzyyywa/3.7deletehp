@@ -143,7 +143,7 @@ class CustomCLIP(nn.Module):
         # 【核心修正 3】：增加组合特征 (Composition) 的文本投影 Linear
         self.c2c_text_c = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+        self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
         self.visual_scale = nn.Parameter(torch.tensor([0.1]))
         self.text_scale = nn.Parameter(torch.tensor([0.1]))
 
