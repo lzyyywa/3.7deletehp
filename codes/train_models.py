@@ -10,7 +10,7 @@ import torch.multiprocessing
 import numpy as np
 import json
 import math
-from torch.nn import CrossEntropyLoss  # 补充导入，防止 NameError
+from torch.nn import CrossEntropyLoss
 from utils.ade_utils import emd_inference_opencv_test
 from collections import Counter
 from utils.hsic import hsic_normalized_cca
@@ -106,15 +106,22 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     model.train()
     best_loss = 1e5
     best_metric = 0
+    
+    # 欧式独有的损失函数实例
+    Loss_fn = CrossEntropyLoss()
     log_training = open(os.path.join(config.save_path, 'log.txt'), 'w')
 
     attr2idx = train_dataset.attr2idx
     obj2idx = train_dataset.obj2idx
 
+    # 欧式需要的训练对索引
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
                                 for attr, obj in train_dataset.train_pairs]).cuda()
 
     train_losses = []
+    
+    # 获取消融实验开关 (默认 True 走双曲)
+    use_hyperbolic = getattr(config, 'use_hyperbolic', True)
 
     for i in range(config.epoch_start, config.epochs):
         progress_bar = tqdm.tqdm(
@@ -122,25 +129,35 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         )
 
         epoch_train_losses = []
-        # ====== 新增：更细致的损失监控列表 ======
         epoch_cls_v_losses = []
         epoch_cls_o_losses = []
+        
+        # 彻底分离：双曲专属监控列表 vs 欧式专属监控列表
         epoch_dal_losses = []
         epoch_hem_losses = []
+        epoch_com_losses = []
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
+        
         for bid, batch in enumerate(train_dataloader):
             batch_img = batch[0].cuda()
             batch_verb = batch[1].cuda()
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
-            batch_coarse_verb = batch[4].cuda()
-            batch_coarse_obj = batch[5].cuda()
-
-            target = [batch_img, batch_verb, batch_obj, batch_target, batch_coarse_verb, batch_coarse_obj]
+            
+            # 兼容不同 dataset 输出长度
+            if len(batch) > 4:
+                batch_coarse_verb = batch[4].cuda()
+                batch_coarse_obj = batch[5].cuda()
+                target = [batch_img, batch_verb, batch_obj, batch_target, batch_coarse_verb, batch_coarse_obj]
+            else:
+                batch_coarse_verb = None
+                batch_coarse_obj = None
+                target = [batch_img, batch_verb, batch_obj, batch_target]
 
             with torch.cuda.amp.autocast(enabled=True):
+                # 调用统一的模型前向传播
                 predict = model(
                     video=batch_img,
                     batch_verb=batch_verb,
@@ -150,9 +167,48 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     pairs=batch_target
                 )
 
-                # ====== 修改：接收 total_loss 和 loss_dict ======
-                loss, loss_dict = loss_calu(predict, target, config)
-                loss = loss / config.gradient_accumulation_steps
+                if use_hyperbolic:
+                    # ====================================================
+                    # 【双曲模式分支】
+                    # ====================================================
+                    loss, loss_dict = loss_calu(predict, target, config)
+                    loss = loss / config.gradient_accumulation_steps
+                    
+                    # 记录双曲独有的损失
+                    epoch_dal_losses.append(loss_dict.get('loss_dal', 0.0))
+                    epoch_hem_losses.append(loss_dict.get('loss_hem', 0.0))
+                    
+                else:
+                    # ====================================================
+                    # 【欧式模式分支】
+                    # ====================================================
+                    p_v = predict['verb_logits_euc']
+                    p_o = predict['obj_logits_euc']
+                    f = predict['pred_com_euc']
+
+                    # 提取合法组合
+                    train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
+                    pred_com_train = f[:, train_v_inds, train_o_inds]
+                    
+                    cosine_scale = getattr(config, 'cosine_scale', 100.0)
+
+                    # 计算交叉熵
+                    loss_com = Loss_fn(pred_com_train * cosine_scale, batch_target)
+                    loss_verb = Loss_fn(p_v * cosine_scale, batch_verb)
+                    loss_obj = Loss_fn(p_o * cosine_scale, batch_obj)
+
+                    total_loss = loss_com + 0.2 * (loss_verb + loss_obj)
+                    loss = total_loss / config.gradient_accumulation_steps
+                    
+                    # 生成名称完全匹配概念的欧式字典
+                    loss_dict = {
+                        'loss_cls_verb': loss_verb.item(),
+                        'loss_cls_obj': loss_obj.item(),
+                        'loss_com': loss_com.item()
+                    }
+                    
+                    # 记录欧式独有的损失
+                    epoch_com_losses.append(loss_dict['loss_com'])
 
             scaler.scale(loss).backward()
 
@@ -162,36 +218,41 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 scaler.update()
                 optimizer.zero_grad()
 
-            # 记录总损失和各个子损失
+            # 记录总损失和基元损失
             epoch_train_losses.append(loss.item() * config.gradient_accumulation_steps)
             epoch_cls_v_losses.append(loss_dict['loss_cls_verb'])
             epoch_cls_o_losses.append(loss_dict['loss_cls_obj'])
-            epoch_dal_losses.append(loss_dict['loss_dal'])
-            epoch_hem_losses.append(loss_dict['loss_hem'])
 
-            # ====== 新增：提取底层的曲率 c 和 温度 tau ======
-            current_c = predict['c_pos'].item()
-            if hasattr(model, 'module'): # 兼容多卡
-                current_temp = F.softplus(model.module.cls_temp).item() + 0.05
+            # ================= 根据模式打印进度条 =================
+            if use_hyperbolic:
+                current_c = predict['c_pos'].item()
+                if hasattr(model, 'module'): 
+                    current_temp = F.softplus(model.module.cls_temp).item() + 0.05
+                else:
+                    current_temp = F.softplus(model.cls_temp).item() + 0.05
+
+                progress_bar.set_postfix({
+                    "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
+                    "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
+                    "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
+                    "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
+                    "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
+                    "c": f"{current_c:.3f}", 
+                    "tau": f"{current_temp:.3f}"
+                })
             else:
-                current_temp = F.softplus(model.cls_temp).item() + 0.05
-
-            # ====== 修改：进度条实时显示所有关键指标（取最近50个batch的平滑平均值） ======
-            progress_bar.set_postfix({
-                "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
-                "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
-                "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
-                "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
-                "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
-                "c": f"{current_c:.3f}", 
-                "tau": f"{current_temp:.3f}"
-            })
+                progress_bar.set_postfix({
+                    "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
+                    "vv": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
+                    "oo": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
+                    "com": f"{np.mean(epoch_com_losses[-50:]):.2f}"  # 彻底显示 com
+                })
+            
             progress_bar.update()
 
         lr_scheduler.step()
         progress_bar.close()
         
-        # 打印并写入到 log.txt
         progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}")
         train_losses.append(np.mean(epoch_train_losses))
         
@@ -199,8 +260,13 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_obj loss {np.mean(epoch_cls_o_losses):.4f}\n")
-        log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
-        log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
+        
+        # ================= 根据模式写入 log =================
+        if use_hyperbolic:
+            log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
+            log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
+        else:
+            log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n")
 
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({
