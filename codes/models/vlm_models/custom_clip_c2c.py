@@ -106,6 +106,10 @@ class VideoEncoder(nn.Module):
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
+        
+        # 【新增：消融实验总开关】
+        self.use_hyperbolic = getattr(cfg, 'use_hyperbolic', True)
+
         self.verb_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'verb')
         self.verb_tokenized_prompts = self.verb_prompt_learner.token_ids
         self.obj_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'object')
@@ -176,74 +180,115 @@ class CustomCLIP(nn.Module):
         # 【核心修正 4】：提取组合视觉特征 v_c
         v_c_feat = self.c2c_CE1(video_features.mean(dim=-1))
 
-        c_pos = torch.clamp(F.softplus(self.c), min=0.5)
+        # ==================== [逻辑分流] ====================
+        if self.use_hyperbolic:
+            # ----------------------------------------------------
+            # 【双曲逻辑】：严格保留你原本的所有映射和截断计算
+            # ----------------------------------------------------
+            c_pos = torch.clamp(F.softplus(self.c), min=0.5)
 
-        with torch.cuda.amp.autocast(enabled=False):
-            c_fp32 = c_pos.float()
-            o_feat_fp32 = o_feat.float() * self.visual_scale.float()
-            v_feat_fp32 = v_feat.float() * self.visual_scale.float()
-            v_c_feat_fp32 = v_c_feat.float() * self.visual_scale.float()
-
-            verb_text_fp32 = verb_text_features.float() * self.text_scale.float()
-            obj_text_fp32 = obj_text_features.float() * self.text_scale.float()
-            coarse_verb_fp32 = coarse_verb_features.float() * self.text_scale.float()
-            coarse_obj_fp32 = coarse_obj_features.float() * self.text_scale.float()
-
-            o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
-            v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
-            v_c_hyp = exp_map0(v_c_feat_fp32, curv=c_fp32) # 将组合视觉特征映射到双曲
-
-            t_v_hyp_all = exp_map0(verb_text_fp32, curv=c_fp32)
-            t_o_hyp_all = exp_map0(obj_text_fp32, curv=c_fp32)
-            coarse_v_hyp_all = exp_map0(coarse_verb_fp32, curv=c_fp32)
-            coarse_o_hyp_all = exp_map0(coarse_obj_fp32, curv=c_fp32)
-
-            verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
-            obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
-
-            temp = F.softplus(self.cls_temp) + 0.05
-            verb_logits = -verb_dist / temp
-            obj_logits = -obj_dist / temp
-
-        if self.training:
-            # 【核心修正 5】：在训练阶段专门提取当前 Batch 对应的组合文本特征 t_c
-            batch_comp_tokens = self.comp_tokens[pairs]
-            with torch.no_grad():
-                batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
-            batch_comp_text_features = self.text_encoder(batch_comp_emb, batch_comp_tokens)
-            batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
-            
             with torch.cuda.amp.autocast(enabled=False):
-                t_c_feat_fp32 = batch_comp_text_features.float() * self.text_scale.float()
-                t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
+                c_fp32 = c_pos.float()
+                o_feat_fp32 = o_feat.float() * self.visual_scale.float()
+                v_feat_fp32 = v_feat.float() * self.visual_scale.float()
+                v_c_feat_fp32 = v_c_feat.float() * self.visual_scale.float()
 
-            t_v_hyp_batch = t_v_hyp_all[batch_verb]
-            t_o_hyp_batch = t_o_hyp_all[batch_obj]
-            coarse_v_hyp_batch = coarse_v_hyp_all[batch_coarse_verb]
-            coarse_o_hyp_batch = coarse_o_hyp_all[batch_coarse_obj]
+                verb_text_fp32 = verb_text_features.float() * self.text_scale.float()
+                obj_text_fp32 = obj_text_features.float() * self.text_scale.float()
+                coarse_verb_fp32 = coarse_verb_features.float() * self.text_scale.float()
+                coarse_obj_fp32 = coarse_obj_features.float() * self.text_scale.float()
 
-            predict = {
-                'c_pos': c_pos,
-                'verb_logits': verb_logits,
-                'obj_logits': obj_logits,
-                'v_hyp': v_hyp,
-                'o_hyp': o_hyp,
-                'v_c_hyp': v_c_hyp,           # 传出 v_c，用于 HEM Loss
-                't_v_hyp': t_v_hyp_batch,
-                't_o_hyp': t_o_hyp_batch,
-                't_c_hyp': t_c_hyp_batch,     # 传出 t_c，用于 HEM Loss
-                'coarse_v_hyp': coarse_v_hyp_batch,
-                'coarse_o_hyp': coarse_o_hyp_batch
-            }
-            return predict
+                o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
+                v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
+                v_c_hyp = exp_map0(v_c_feat_fp32, curv=c_fp32) # 将组合视觉特征映射到双曲
+
+                t_v_hyp_all = exp_map0(verb_text_fp32, curv=c_fp32)
+                t_o_hyp_all = exp_map0(obj_text_fp32, curv=c_fp32)
+                coarse_v_hyp_all = exp_map0(coarse_verb_fp32, curv=c_fp32)
+                coarse_o_hyp_all = exp_map0(coarse_obj_fp32, curv=c_fp32)
+
+                verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
+                obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
+
+                temp = F.softplus(self.cls_temp) + 0.05
+                verb_logits = -verb_dist / temp
+                obj_logits = -obj_dist / temp
+
+            if self.training:
+                # 【核心修正 5】：在训练阶段专门提取当前 Batch 对应的组合文本特征 t_c
+                batch_comp_tokens = self.comp_tokens[pairs]
+                with torch.no_grad():
+                    batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
+                batch_comp_text_features = self.text_encoder(batch_comp_emb, batch_comp_tokens)
+                batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
+                
+                with torch.cuda.amp.autocast(enabled=False):
+                    t_c_feat_fp32 = batch_comp_text_features.float() * self.text_scale.float()
+                    t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
+
+                t_v_hyp_batch = t_v_hyp_all[batch_verb]
+                t_o_hyp_batch = t_o_hyp_all[batch_obj]
+                coarse_v_hyp_batch = coarse_v_hyp_all[batch_coarse_verb]
+                coarse_o_hyp_batch = coarse_o_hyp_all[batch_coarse_obj]
+
+                predict = {
+                    'c_pos': c_pos,
+                    'verb_logits': verb_logits,
+                    'obj_logits': obj_logits,
+                    'v_hyp': v_hyp,
+                    'o_hyp': o_hyp,
+                    'v_c_hyp': v_c_hyp,           # 传出 v_c，用于 HEM Loss
+                    't_v_hyp': t_v_hyp_batch,
+                    't_o_hyp': t_o_hyp_batch,
+                    't_c_hyp': t_c_hyp_batch,     # 传出 t_c，用于 HEM Loss
+                    'coarse_v_hyp': coarse_v_hyp_batch,
+                    'coarse_o_hyp': coarse_o_hyp_batch
+                }
+                return predict
+            else:
+                verb_prob = torch.softmax(verb_logits, dim=-1)
+                obj_prob = torch.softmax(obj_logits, dim=-1)
+                pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)
+
+                verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
+                com_logits = pred_com[:, verb_idx, obj_idx]
+                return com_logits
+
         else:
-            verb_prob = torch.softmax(verb_logits, dim=-1)
-            obj_prob = torch.softmax(obj_logits, dim=-1)
-            pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)
+            # ----------------------------------------------------
+            # 【纯欧式逻辑】：严格还原 eur_c2c (不走 exp_map0)
+            # ----------------------------------------------------
+            with torch.cuda.amp.autocast(enabled=False):
+                # 1. 严格使用 L2 归一化 (复刻 eur_c2c)
+                o_feat_normed = F.normalize(o_feat.float(), dim=1)
+                v_feat_normed = F.normalize(v_feat.float(), dim=1)
 
-            verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-            com_logits = pred_com[:, verb_idx, obj_idx]
-            return com_logits
+                verb_text_features_norm = F.normalize(verb_text_features.float(), dim=-1)
+                obj_text_features_norm = F.normalize(obj_text_features.float(), dim=-1)
+
+                # 2. 纯欧式内积计算 logits (不除以 temperature)
+                verb_logits_euc = v_feat_normed @ verb_text_features_norm.t()
+                obj_logits_euc = o_feat_normed @ obj_text_features_norm.t()
+
+                # 3. 欧式专属的概率平移 (* 0.5 + 0.5)
+                verb_logits_euc = verb_logits_euc * 0.5 + 0.5
+                obj_logits_euc = obj_logits_euc * 0.5 + 0.5
+
+                # 4. 外积得到组合预测矩阵 [Batch, N_verb, N_obj]
+                pred_com_euc = torch.einsum('bi,bj->bij', verb_logits_euc, obj_logits_euc)
+
+            if self.training:
+                # 训练阶段：构造欧式专属字典，传给 train_models.py 里的欧式分支
+                return {
+                    'verb_logits_euc': verb_logits_euc,
+                    'obj_logits_euc': obj_logits_euc,
+                    'pred_com_euc': pred_com_euc
+                }
+            else:
+                # 测试阶段：利用 pairs 索引出对应的组合概率
+                verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
+                com_logits_euc = pred_com_euc[:, verb_idx, obj_idx]
+                return com_logits_euc
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.backbone
