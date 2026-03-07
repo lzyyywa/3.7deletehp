@@ -74,6 +74,7 @@ train:
   w_cls: 0.2   #动词/物品分类损失权重
   w_dal: 0.0   #判别对齐损失权重
   w_hem: 0.0   #层次蕴含  
+  use_hyperbolic: False
 
 test:
   eval_batch_size: 32
