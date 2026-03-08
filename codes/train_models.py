@@ -106,7 +106,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     model.train()
     best_loss = 1e5
     best_metric = 0
-    
+
     # 欧式独有的损失函数实例
     Loss_fn = CrossEntropyLoss()
     log_training = open(os.path.join(config.save_path, 'log.txt'), 'w')
@@ -119,7 +119,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                                 for attr, obj in train_dataset.train_pairs]).cuda()
 
     train_losses = []
-    
+
     # 获取消融实验开关 (默认 True 走双曲)
     use_hyperbolic = getattr(config, 'use_hyperbolic', True)
 
@@ -131,7 +131,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         epoch_train_losses = []
         epoch_cls_v_losses = []
         epoch_cls_o_losses = []
-        
+
         # 彻底分离：双曲专属监控列表 vs 欧式专属监控列表
         epoch_dal_losses = []
         epoch_hem_losses = []
@@ -139,13 +139,13 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
         temp_lr = optimizer.param_groups[-1]['lr']
         print(f'Current_lr:{temp_lr}')
-        
+
         for bid, batch in enumerate(train_dataloader):
             batch_img = batch[0].cuda()
             batch_verb = batch[1].cuda()
             batch_obj = batch[2].cuda()
             batch_target = batch[3].cuda()
-            
+
             # 兼容不同 dataset 输出长度
             if len(batch) > 4:
                 batch_coarse_verb = batch[4].cuda()
@@ -173,11 +173,11 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     # ====================================================
                     loss, loss_dict = loss_calu(predict, target, config)
                     loss = loss / config.gradient_accumulation_steps
-                    
+
                     # 记录双曲独有的损失
                     epoch_dal_losses.append(loss_dict.get('loss_dal', 0.0))
                     epoch_hem_losses.append(loss_dict.get('loss_hem', 0.0))
-                    
+
                 else:
                     # ====================================================
                     # 【欧式模式分支】
@@ -189,7 +189,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     # 提取合法组合
                     train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
                     pred_com_train = f[:, train_v_inds, train_o_inds]
-                    
+
                     cosine_scale = getattr(config, 'cosine_scale', 100.0)
 
                     # 计算交叉熵
@@ -199,14 +199,14 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
 
                     total_loss = loss_com + 0.2 * (loss_verb + loss_obj)
                     loss = total_loss / config.gradient_accumulation_steps
-                    
+
                     # 生成名称完全匹配概念的欧式字典
                     loss_dict = {
                         'loss_cls_verb': loss_verb.item(),
                         'loss_cls_obj': loss_obj.item(),
                         'loss_com': loss_com.item()
                     }
-                    
+
                     # 记录欧式独有的损失
                     epoch_com_losses.append(loss_dict['loss_com'])
 
@@ -226,7 +226,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
             # ================= 根据模式打印进度条 =================
             if use_hyperbolic:
                 current_c = predict['c_pos'].item()
-                if hasattr(model, 'module'): 
+                if hasattr(model, 'module'):
                     current_temp = F.softplus(model.module.cls_temp).item() + 0.05
                 else:
                     current_temp = F.softplus(model.cls_temp).item() + 0.05
@@ -237,7 +237,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
                     "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
                     "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
-                    "c": f"{current_c:.3f}", 
+                    "c": f"{current_c:.3f}",
                     "tau": f"{current_temp:.3f}"
                 })
             else:
@@ -247,20 +247,20 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     "oo": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
                     "com": f"{np.mean(epoch_com_losses[-50:]):.2f}"  # 彻底显示 com
                 })
-            
+
             progress_bar.update()
 
         lr_scheduler.step()
         progress_bar.close()
-        
+
         progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}")
         train_losses.append(np.mean(epoch_train_losses))
-        
+
         log_training.write('\n')
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_obj loss {np.mean(epoch_cls_o_losses):.4f}\n")
-        
+
         # ================= 根据模式写入 log =================
         if use_hyperbolic:
             log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
@@ -275,7 +275,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                 'scheduler': lr_scheduler.state_dict(),
                 'scaler': scaler.state_dict(),
             }, config.save_path, i)
-            
+
         key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
         if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
             print("Evaluating val dataset:")
@@ -329,7 +329,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     log_training.write("Loss average on test dataset: {}\n".format(loss_avg))
         log_training.write('\n')
         log_training.flush()
-        
+
         if i + 1 == config.epochs:
             print("Evaluating test dataset on Closed World")
             model.load_state_dict(torch.load(os.path.join(
