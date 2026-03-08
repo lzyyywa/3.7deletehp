@@ -5,7 +5,6 @@ from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 from models.vlm_models.text_learner import get_text_learner
 import torch.nn.functional as F
 from einops import rearrange
-import math  # 【新增】：用于对数和指数计算
 
 from utils.lorentz import exp_map0, pairwise_dist
 
@@ -107,7 +106,7 @@ class VideoEncoder(nn.Module):
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
-        
+
         # 【新增：消融实验总开关】
         self.use_hyperbolic = getattr(cfg, 'use_hyperbolic', True)
 
@@ -139,7 +138,7 @@ class CustomCLIP(nn.Module):
 
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
-        
+
         # 【核心修正 2】：增加组合特征 (Composition) 的视觉投影 MLP
         self.c2c_CE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
@@ -148,16 +147,9 @@ class CustomCLIP(nn.Module):
         # 【核心修正 3】：增加组合特征 (Composition) 的文本投影 Linear
         self.c2c_text_c = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
-        # ==================== 【对齐 hycoclip 安全护城河】 ====================
-        curv_init = 1.0
-        self.c = nn.Parameter(torch.tensor([math.log(curv_init)]), requires_grad=True)
-        self._curv_minmax = {"min": math.log(curv_init / 10.0), "max": math.log(curv_init * 10.0)}
-
-        # 精妙初始化：让初始特征的模长被完美拉回 1.0 附近
-        init_scale = math.log(float(cfg.emb_dim) ** -0.5)
-        self.visual_scale = nn.Parameter(torch.tensor([init_scale]))
-        self.text_scale = nn.Parameter(torch.tensor([init_scale]))
-        # ======================================================================
+        self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
+        self.visual_scale = nn.Parameter(torch.tensor([0.1]))
+        self.text_scale = nn.Parameter(torch.tensor([0.1]))
 
         self.cls_temp = nn.Parameter(torch.tensor([0.07]))
 
@@ -184,36 +176,27 @@ class CustomCLIP(nn.Module):
         o_feat = self.c2c_OE1(video_features.mean(dim=-1))
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
-        
+
         # 【核心修正 4】：提取组合视觉特征 v_c
         v_c_feat = self.c2c_CE1(video_features.mean(dim=-1))
 
         # ==================== [逻辑分流] ====================
         if self.use_hyperbolic:
             # ----------------------------------------------------
-            # 【双曲逻辑】：严格保留你原本的所有映射和距离计算
+            # 【双曲逻辑】：严格保留你原本的所有映射和截断计算
             # ----------------------------------------------------
-            # 限制曲率 c 和尺度 scale 永远不会爆炸
-            self.c.data = torch.clamp(self.c.data, **self._curv_minmax)
-            c_pos = self.c.exp()
-            
-            self.visual_scale.data = torch.clamp(self.visual_scale.data, max=0.0)
-            self.text_scale.data = torch.clamp(self.text_scale.data, max=0.0)
-            v_scale_exp = self.visual_scale.exp()
-            t_scale_exp = self.text_scale.exp()
+            c_pos = torch.clamp(F.softplus(self.c), min=0.5)
 
             with torch.cuda.amp.autocast(enabled=False):
                 c_fp32 = c_pos.float()
-                
-                # 乘以指数化后的安全 Scale 因子
-                o_feat_fp32 = o_feat.float() * v_scale_exp.float()
-                v_feat_fp32 = v_feat.float() * v_scale_exp.float()
-                v_c_feat_fp32 = v_c_feat.float() * v_scale_exp.float()
+                o_feat_fp32 = o_feat.float() * self.visual_scale.float()
+                v_feat_fp32 = v_feat.float() * self.visual_scale.float()
+                v_c_feat_fp32 = v_c_feat.float() * self.visual_scale.float()
 
-                verb_text_fp32 = verb_text_features.float() * t_scale_exp.float()
-                obj_text_fp32 = obj_text_features.float() * t_scale_exp.float()
-                coarse_verb_fp32 = coarse_verb_features.float() * t_scale_exp.float()
-                coarse_obj_fp32 = coarse_obj_features.float() * t_scale_exp.float()
+                verb_text_fp32 = verb_text_features.float() * self.text_scale.float()
+                obj_text_fp32 = obj_text_features.float() * self.text_scale.float()
+                coarse_verb_fp32 = coarse_verb_features.float() * self.text_scale.float()
+                coarse_obj_fp32 = coarse_obj_features.float() * self.text_scale.float()
 
                 o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
                 v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
@@ -238,9 +221,9 @@ class CustomCLIP(nn.Module):
                     batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
                 batch_comp_text_features = self.text_encoder(batch_comp_emb, batch_comp_tokens)
                 batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
-                
+
                 with torch.cuda.amp.autocast(enabled=False):
-                    t_c_feat_fp32 = batch_comp_text_features.float() * t_scale_exp.float()
+                    t_c_feat_fp32 = batch_comp_text_features.float() * self.text_scale.float()
                     t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
 
                 t_v_hyp_batch = t_v_hyp_all[batch_verb]
@@ -254,10 +237,10 @@ class CustomCLIP(nn.Module):
                     'obj_logits': obj_logits,
                     'v_hyp': v_hyp,
                     'o_hyp': o_hyp,
-                    'v_c_hyp': v_c_hyp,            # 传出 v_c，用于 HEM Loss
+                    'v_c_hyp': v_c_hyp,           # 传出 v_c，用于 HEM Loss
                     't_v_hyp': t_v_hyp_batch,
                     't_o_hyp': t_o_hyp_batch,
-                    't_c_hyp': t_c_hyp_batch,      # 传出 t_c，用于 HEM Loss
+                    't_c_hyp': t_c_hyp_batch,     # 传出 t_c，用于 HEM Loss
                     'coarse_v_hyp': coarse_v_hyp_batch,
                     'coarse_o_hyp': coarse_o_hyp_batch
                 }
