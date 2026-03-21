@@ -1,291 +1,154 @@
-import os
-import random
-
-from torch.utils.data.dataloader import DataLoader
-import tqdm
-import test as test
-from loss import *
-from loss import KLLoss
-import torch.multiprocessing
-import numpy as np
-import json
+import torch.nn.functional as F
+import torch.nn as nn
+import torch
 import math
-from torch.nn import CrossEntropyLoss
-from utils.ade_utils import emd_inference_opencv_test
-from collections import Counter
-from utils.hsic import hsic_normalized_cca
+import numpy as np
+
+from utils.lorentz import pairwise_dist, half_aperture, oxy_angle
+
+# =====================================================================
+# 【双曲空间专属 Loss】
+# =====================================================================
+
+class HierarchicalEntailmentLoss(nn.Module):
+    def __init__(self, K=0.1):
+        super().__init__()
+        self.K = K
+
+    def forward(self, child, parent, c):
+        with torch.cuda.amp.autocast(enabled=False):
+            theta = oxy_angle(parent.float(), child.float(), curv=c.float()).unsqueeze(1)               
+            alpha_parent = half_aperture(parent.float(), curv=c.float(), min_radius=self.K).unsqueeze(1) 
+            loss_cone = F.relu(theta - alpha_parent)
+        return loss_cone.mean()
 
 
-def cal_conditional(attr2idx, obj2idx, set_name, daset):
-    def load_split(path):
-        with open(path, 'r') as f:
-            loaded_data = json.load(f)
-        return loaded_data
+class DiscriminativeAlignmentLoss(nn.Module):
+    def __init__(self, temperature=0.07, hard_weight=3.0):
+        super().__init__()
+        self.temperature = temperature
+        self.hard_weight = hard_weight
+        self.criterion = nn.CrossEntropyLoss()
 
-    train_data = daset.train_data
-    val_data = daset.val_data
-    test_data = daset.test_data
-    all_data = train_data + val_data + test_data
-    if set_name == 'test':
-        used_data = test_data
-    elif set_name == 'all':
-        used_data = all_data
-    elif set_name == 'train':
-        used_data = train_data
-
-    v_o = torch.zeros(size=(len(attr2idx), len(obj2idx)))
-    for item in used_data:
-        verb_idx = attr2idx[item[1]]
-        obj_idx = obj2idx[item[2]]
-
-        v_o[verb_idx, obj_idx] += 1
-
-    v_o_on_v = v_o / (torch.sum(v_o, dim=1, keepdim=True) + 1.0e-6)
-    v_o_on_o = v_o / (torch.sum(v_o, dim=0, keepdim=True) + 1.0e-6)
-
-    return v_o_on_v, v_o_on_o
-
-
-def evaluate(model, dataset, config):
-    model.eval()
-    evaluator = test.Evaluator(dataset, model=None)
-    all_logits, all_attr_gt, all_obj_gt, all_pair_gt, loss_avg = test.predict_logits(
-        model, dataset, config)
-    test_stats = test.test(
-        dataset,
-        evaluator,
-        all_logits,
-        all_attr_gt,
-        all_obj_gt,
-        all_pair_gt,
-        config
-    )
-    result = ""
-    key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
-
-    for key in key_set:
-        result = result + key + "  " + str(round(test_stats[key], 4)) + "| "
-    print(result)
-    model.train()
-    return loss_avg, test_stats
-
-
-def save_checkpoint(state, save_path, epoch, best=False):
-    filename = os.path.join(save_path, f"epoch_resume.pt")
-    torch.save(state, filename)
-
-
-def rand_bbox(size, lam):
-    W = size[-2]
-    H = size[-1]
-    cut_rat = np.sqrt(1. - lam)
-    cut_w = np.int_(W * cut_rat)
-    cut_h = np.int_(H * cut_rat)
-
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return bbx1, bby1, bbx2, bby2
-
-
-def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_dataset, test_dataset, scaler):
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=config.train_batch_size,
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=True
-    )
-
-    model.train()
-    best_loss = 1e5
-    best_metric = 0
-
-    Loss_fn = CrossEntropyLoss()
-    log_training = open(os.path.join(config.save_path, 'log.txt'), 'w')
-
-    attr2idx = train_dataset.attr2idx
-    obj2idx = train_dataset.obj2idx
-
-    # ==============================================================
-    # 【修复命脉】：必须把 train_pairs 传进 config！否则 loss.py 取不到
-    # ==============================================================
-    train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
-                                for attr, obj in train_dataset.train_pairs]).cuda()
-    config.train_pairs = train_pairs 
-
-    train_losses = []
-    use_hyperbolic = getattr(config, 'use_hyperbolic', True)
-
-    for i in range(config.epoch_start, config.epochs):
-        progress_bar = tqdm.tqdm(
-            total=len(train_dataloader), desc="epoch % 3d" % (i + 1)
-        )
-
-        epoch_train_losses = []
-        epoch_cls_v_losses = []
-        epoch_cls_o_losses = []
-        epoch_dal_losses = []
-        epoch_hem_losses = []
-        epoch_com_losses = []
-
-        temp_lr = optimizer.param_groups[-1]['lr']
-        print(f'Current_lr:{temp_lr}')
-
-        for bid, batch in enumerate(train_dataloader):
-            batch_img = batch[0].cuda()
-            batch_verb = batch[1].cuda()
-            batch_obj = batch[2].cuda()
-            batch_target = batch[3].cuda()
-
-            if len(batch) > 4:
-                batch_coarse_verb = batch[4].cuda()
-                batch_coarse_obj = batch[5].cuda()
-                target = [batch_img, batch_verb, batch_obj, batch_target, batch_coarse_verb, batch_coarse_obj]
-            else:
-                batch_coarse_verb = None
-                batch_coarse_obj = None
-                target = [batch_img, batch_verb, batch_obj, batch_target]
-
-            with torch.cuda.amp.autocast(enabled=True):
-                predict = model(
-                    video=batch_img,
-                    batch_verb=batch_verb,
-                    batch_obj=batch_obj,
-                    batch_coarse_verb=batch_coarse_verb,
-                    batch_coarse_obj=batch_coarse_obj,
-                    pairs=batch_target
-                )
-
-                if use_hyperbolic:
-                    loss, loss_dict = loss_calu(predict, target, config)
-                    loss = loss / config.gradient_accumulation_steps
-
-                    epoch_dal_losses.append(loss_dict.get('loss_dal', 0.0))
-                    epoch_hem_losses.append(loss_dict.get('loss_hem', 0.0))
-                    epoch_com_losses.append(loss_dict.get('loss_com', 0.0))
-
-                else:
-                    p_v = predict['verb_logits_euc']
-                    p_o = predict['obj_logits_euc']
-                    f = predict['pred_com_euc']
-
-                    train_v_inds, train_o_inds = train_pairs[:, 0], train_pairs[:, 1]
-                    pred_com_train = f[:, train_v_inds, train_o_inds]
-
-                    cosine_scale = getattr(config, 'cosine_scale', 100.0)
-
-                    loss_com = Loss_fn(pred_com_train * cosine_scale, batch_target)
-                    loss_verb = Loss_fn(p_v * cosine_scale, batch_verb)
-                    loss_obj = Loss_fn(p_o * cosine_scale, batch_obj)
-
-                    total_loss = loss_com + 0.2 * (loss_verb + loss_obj)
-                    loss = total_loss / config.gradient_accumulation_steps
-
-                    loss_dict = {
-                        'loss_cls_verb': loss_verb.item(),
-                        'loss_cls_obj': loss_obj.item(),
-                        'loss_com': loss_com.item()
-                    }
-                    epoch_com_losses.append(loss_dict['loss_com'])
-
-            scaler.scale(loss).backward()
-
-            if ((bid + 1) % config.gradient_accumulation_steps == 0) or (bid + 1 == len(train_dataloader)):
-                scaler.unscale_(optimizer)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-
-            epoch_train_losses.append(loss.item() * config.gradient_accumulation_steps)
-            epoch_cls_v_losses.append(loss_dict['loss_cls_verb'])
-            epoch_cls_o_losses.append(loss_dict['loss_cls_obj'])
-
-            if use_hyperbolic:
-                current_c = predict['c_pos'].item()
-                if hasattr(model, 'module'):
-                    current_temp = F.softplus(model.module.cls_temp).item() + 0.05
-                else:
-                    current_temp = F.softplus(model.cls_temp).item() + 0.05
-
-                progress_bar.set_postfix({
-                    "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
-                    "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
-                    "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
-                    "com": f"{np.mean(epoch_com_losses[-50:]):.2f}",
-                    "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
-                    "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
-                    "c": f"{current_c:.3f}",
-                    "tau": f"{current_temp:.3f}"
-                })
-            else:
-                progress_bar.set_postfix({
-                    "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
-                    "vv": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
-                    "oo": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
-                    "com": f"{np.mean(epoch_com_losses[-50:]):.2f}"  
-                })
-
-            progress_bar.update()
-
-        lr_scheduler.step()
-        progress_bar.close()
-
-        progress_bar.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}")
-        train_losses.append(np.mean(epoch_train_losses))
-
-        log_training.write('\n')
-        log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
-        log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
-        log_training.write(f"epoch {i + 1} cls_obj loss {np.mean(epoch_cls_o_losses):.4f}\n")
-        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n")
-
-        if use_hyperbolic:
-            log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
-            log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
-
-        if (i + 1) % config.save_every_n == 0:
-            save_checkpoint({
-                'state_dict': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': lr_scheduler.state_dict(),
-                'scaler': scaler.state_dict(),
-            }, config.save_path, i)
-
-        key_set = ["attr_acc", "obj_acc", "ub_seen", "ub_unseen", "ub_all", "best_seen", "best_unseen", "best_hm", "AUC"]
-        if i % config.eval_every_n == 0 or i + 1 == config.epochs or i >= config.val_epochs_ts:
-            print("Evaluating val dataset:")
-            loss_avg, val_result = evaluate(model, val_dataset, config)
-            result = ""
-            for key in val_result:
-                if key in key_set:
-                    result = result + key + "  " + str(round(val_result[key], 4)) + "| "
-            log_training.write('\n')
-            log_training.write(result)
-            print("Loss average on val dataset: {}".format(loss_avg))
-            log_training.write('\n')
-            log_training.write("Loss average on val dataset: {}\n".format(loss_avg))
+    def forward(self, v_hyp, t_hyp, c, mask_pos, mask_hard):
+        with torch.cuda.amp.autocast(enabled=False):
+            dist = pairwise_dist(v_hyp.float(), t_hyp.float(), curv=c.float())
+            logits = -dist / self.temperature
             
-            if val_result[config.best_model_metric] > best_metric:
-                best_metric = val_result[config.best_model_metric]
-                log_training.write('\n')
-                print('find best!')
-                log_training.write('find best!')
-                loss_avg, val_result = evaluate(model, test_dataset, config)
-                torch.save(model.state_dict(), os.path.join(config.save_path, f"best.pt"))
-                result = ""
-                for key in val_result:
-                    if key in key_set:
-                        result = result + key + "  " + str(round(val_result[key], 4)) + "| "
-                log_training.write('\n')
-                log_training.write(result)
-                print("Loss average on test dataset: {}".format(loss_avg))
-                log_training.write('\n')
-                log_training.write("Loss average on test dataset: {}\n".format(loss_avg))
-        log_training.write('\n')
-        log_training.flush()
+            B = v_hyp.size(0)
+            
+            if self.hard_weight > 1.0:
+                logits = logits + mask_hard.float() * math.log(self.hard_weight)
+                
+            false_negatives = mask_pos & ~torch.eye(B, dtype=torch.bool, device=v_hyp.device)
+            logits.masked_fill_(false_negatives, -1e9)
+            
+            labels = torch.arange(B, device=v_hyp.device)
+            
+        loss_v2t = self.criterion(logits, labels)
+        loss_t2v = self.criterion(logits.t(), labels)
+        return (loss_v2t + loss_t2v) / 2.0
+
+
+def loss_calu(predict, target, config):
+    batch_img, batch_verb, batch_obj, batch_target, batch_coarse_verb, batch_coarse_obj = target
+    batch_verb = batch_verb.cuda()
+    batch_obj = batch_obj.cuda()
+    batch_target = batch_target.cuda()
+    
+    c_pos = predict['c_pos']
+    verb_logits = predict['verb_logits']
+    obj_logits = predict['obj_logits']
+    
+    # 【为你恢复的核心】：提取组合推理概率
+    pred_com_logits = predict['pred_com_logits']
+    
+    v_hyp = predict['v_hyp']                  
+    o_hyp = predict['o_hyp']
+    v_c_hyp = predict['v_c_hyp']              
+    t_v_hyp = predict['t_v_hyp']              
+    t_o_hyp = predict['t_o_hyp']
+    t_c_hyp = predict['t_c_hyp']              
+    coarse_v_hyp = predict['coarse_v_hyp']    
+    coarse_o_hyp = predict['coarse_o_hyp']    
+
+    ce_loss_fn = nn.CrossEntropyLoss()
+    dal_loss_fn = DiscriminativeAlignmentLoss(temperature=0.07, hard_weight=3.0)
+    hem_loss_fn = HierarchicalEntailmentLoss(K=0.1)
+
+    # 1. 基元分类损失
+    loss_cls_verb = ce_loss_fn(verb_logits, batch_verb)
+    loss_cls_obj = ce_loss_fn(obj_logits, batch_obj)
+    
+    # 2. 【为你恢复的：组合推理损失 loss_com】
+    train_pairs = config.train_pairs
+    train_v_inds = train_pairs[:, 0]
+    train_o_inds = train_pairs[:, 1]
+    # 利用训练对索引出 [Batch, Num_Train_Pairs] 的合法推断概率
+    pred_com_train = pred_com_logits[:, train_v_inds, train_o_inds]
+    loss_com = ce_loss_fn(pred_com_train, batch_target)
+
+    # 3. DAL 对齐损失
+    mask_verb = (batch_verb.unsqueeze(1) == batch_verb.unsqueeze(0))
+    mask_obj = (batch_obj.unsqueeze(1) == batch_obj.unsqueeze(0))
+    mask_pos_comp = mask_verb & mask_obj
+    mask_hard_comp = mask_verb ^ mask_obj 
+    loss_dal = dal_loss_fn(v_c_hyp, t_c_hyp, c_pos, mask_pos=mask_pos_comp, mask_hard=mask_hard_comp)
+    
+    # 4. HEM 层级蕴含损失
+    loss_hem_vc2vs = hem_loss_fn(child=v_c_hyp, parent=v_hyp, c=c_pos)
+    loss_hem_vc2vo = hem_loss_fn(child=v_c_hyp, parent=o_hyp, c=c_pos)
+    loss_hem_tc2ts = hem_loss_fn(child=t_c_hyp, parent=t_v_hyp, c=c_pos)
+    loss_hem_tc2to = hem_loss_fn(child=t_c_hyp, parent=t_o_hyp, c=c_pos)
+    loss_hem_ts2tsp = hem_loss_fn(child=t_v_hyp, parent=coarse_v_hyp, c=c_pos)
+    loss_hem_to2top = hem_loss_fn(child=t_o_hyp, parent=coarse_o_hyp, c=c_pos)
+
+    loss_hem = loss_hem_vc2vs + loss_hem_vc2vo + \
+               loss_hem_tc2ts + loss_hem_tc2to + \
+               loss_hem_ts2tsp + loss_hem_to2top
+
+    # ==============================================================
+    # 总损失汇聚：严谨加上 w_com * loss_com！
+    # ==============================================================
+    w_cls = getattr(config, 'w_cls', 1.0)
+    w_com = getattr(config, 'w_com', 1.0)
+    w_dal = getattr(config, 'w_dal', 1.0)
+    w_hem = getattr(config, 'w_hem', 1.0)
+
+    total_loss = w_cls * (loss_cls_verb + loss_cls_obj) + \
+                 w_com * loss_com + \
+                 w_dal * loss_dal + \
+                 w_hem * loss_hem
+                 
+    loss_dict = {
+        'loss_cls_verb': loss_cls_verb.item(),
+        'loss_cls_obj': loss_cls_obj.item(),
+        'loss_com': loss_com.item(),
+        'loss_dal': loss_dal.item(),
+        'loss_hem': loss_hem.item()
+    }
+
+    return total_loss, loss_dict
+
+class KLLoss(nn.Module):
+    def __init__(self, error_metric=nn.KLDivLoss(size_average=True, reduce=True)):
+        super().__init__()
+        self.error_metric = error_metric
+
+    def forward(self, prediction, label, mul=False):
+        batch_size = prediction.shape[0]
+        probs1 = F.log_softmax(prediction, 1)
+        probs2 = F.softmax(label, 1)
+        loss = self.error_metric(probs1, probs2)
+        if mul:
+            return loss * batch_size
+        else:
+            return loss
+
+
+def hsic_loss(input1, input2, unbiased=False):
+    pass
+
+
+class Gml_loss(nn.Module):
+    pass
