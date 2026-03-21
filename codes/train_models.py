@@ -174,9 +174,10 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     loss, loss_dict = loss_calu(predict, target, config)
                     loss = loss / config.gradient_accumulation_steps
 
-                    # 记录双曲独有的损失
+                    # 【修正】：增加提取 loss_com！双曲独有和共有损失全部记录
                     epoch_dal_losses.append(loss_dict.get('loss_dal', 0.0))
                     epoch_hem_losses.append(loss_dict.get('loss_hem', 0.0))
+                    epoch_com_losses.append(loss_dict.get('loss_com', 0.0))
 
                 else:
                     # ====================================================
@@ -235,6 +236,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
                     "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
                     "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
+                    "com": f"{np.mean(epoch_com_losses[-50:]):.2f}",    # 【修正】：加回 COM 打印
                     "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
                     "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
                     "c": f"{current_c:.3f}",
@@ -245,7 +247,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
                     "vv": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
                     "oo": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
-                    "com": f"{np.mean(epoch_com_losses[-50:]):.2f}"  # 彻底显示 com
+                    "com": f"{np.mean(epoch_com_losses[-50:]):.2f}"  
                 })
 
             progress_bar.update()
@@ -260,13 +262,14 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_obj loss {np.mean(epoch_cls_o_losses):.4f}\n")
+        
+        # 【修正】：无论双曲还是欧式，现在都有组合损失 com，直接统一写入！
+        log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n")
 
         # ================= 根据模式写入 log =================
         if use_hyperbolic:
             log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
             log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
-        else:
-            log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n")
 
         if (i + 1) % config.save_every_n == 0:
             save_checkpoint({
