@@ -10,6 +10,15 @@ from utils.lorentz import exp_map0, pairwise_dist
 
 _tokenizer = _Tokenizer()
 
+# =====================================================================
+# 【终极优化 2】：补充丢失的防爆核心！最大模长裁剪 (Norm Clipping)
+# 缺少这个，特征会撞击双曲圆盘边缘，导致梯度消失和基础分类崩溃！
+# =====================================================================
+def clip_by_norm(x, max_norm=5.0): 
+    norm = torch.norm(x, dim=-1, keepdim=True)
+    scale = torch.clamp(max_norm / (norm + 1e-6), max=1.0)
+    return x * scale
+
 class MLP(nn.Module):
     def __init__(self, inp_dim, out_dim, num_layers=1, relu=True, bias=True, dropout=False, norm=False, layers=[]):
         super(MLP, self).__init__()
@@ -107,7 +116,6 @@ class CustomCLIP(nn.Module):
     def __init__(self, cfg, train_dataset, clip_model):
         super().__init__()
 
-        # 【新增：消融实验总开关】
         self.use_hyperbolic = getattr(cfg, 'use_hyperbolic', True)
 
         self.verb_prompt_learner = get_text_learner(cfg, train_dataset, clip_model, 'verb')
@@ -126,7 +134,6 @@ class CustomCLIP(nn.Module):
         self.register_buffer('coarse_verb_tokens', clip.tokenize(coarse_verb_prompts))
         self.register_buffer('coarse_obj_tokens', clip.tokenize(coarse_obj_prompts))
 
-        # 【核心修正 1】：获取整个数据集的组合 prompt 模板，转成 tokens 缓存
         comp_prompts = [f"a video of a person {v} {o}" for v, o in train_dataset.pairs]
         self.register_buffer('comp_tokens', clip.tokenize(comp_prompts))
 
@@ -138,13 +145,10 @@ class CustomCLIP(nn.Module):
 
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
-
-        # 【核心修正 2】：增加组合特征 (Composition) 的视觉投影 MLP
         self.c2c_CE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
 
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
-        # 【核心修正 3】：增加组合特征 (Composition) 的文本投影 Linear
         self.c2c_text_c = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
 
         self.c = nn.Parameter(torch.tensor([1.0]), requires_grad=True)
@@ -177,30 +181,29 @@ class CustomCLIP(nn.Module):
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        # 【核心修正 4】：提取组合视觉特征 v_c
         v_c_feat = self.c2c_CE1(video_features.mean(dim=-1))
 
         # ==================== [逻辑分流] ====================
         if self.use_hyperbolic:
-            # ----------------------------------------------------
-            # 【双曲逻辑】：严格保留你原本的所有映射和截断计算
-            # ----------------------------------------------------
             c_pos = torch.clamp(F.softplus(self.c), min=0.5)
+            MAX_R = 5.0 # 防爆半径
 
             with torch.cuda.amp.autocast(enabled=False):
                 c_fp32 = c_pos.float()
-                o_feat_fp32 = o_feat.float() * self.visual_scale.float()
-                v_feat_fp32 = v_feat.float() * self.visual_scale.float()
-                v_c_feat_fp32 = v_c_feat.float() * self.visual_scale.float()
+                
+                # 【执行优化 2：特征必须先裁剪再映射，否则边缘效应会导致梯度锁死！】
+                o_feat_fp32 = clip_by_norm(o_feat.float() * self.visual_scale.float(), MAX_R)
+                v_feat_fp32 = clip_by_norm(v_feat.float() * self.visual_scale.float(), MAX_R)
+                v_c_feat_fp32 = clip_by_norm(v_c_feat.float() * self.visual_scale.float(), MAX_R)
 
-                verb_text_fp32 = verb_text_features.float() * self.text_scale.float()
-                obj_text_fp32 = obj_text_features.float() * self.text_scale.float()
-                coarse_verb_fp32 = coarse_verb_features.float() * self.text_scale.float()
-                coarse_obj_fp32 = coarse_obj_features.float() * self.text_scale.float()
+                verb_text_fp32 = clip_by_norm(verb_text_features.float() * self.text_scale.float(), MAX_R)
+                obj_text_fp32 = clip_by_norm(obj_text_features.float() * self.text_scale.float(), MAX_R)
+                coarse_verb_fp32 = clip_by_norm(coarse_verb_features.float() * self.text_scale.float(), MAX_R)
+                coarse_obj_fp32 = clip_by_norm(coarse_obj_features.float() * self.text_scale.float(), MAX_R)
 
                 o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
                 v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
-                v_c_hyp = exp_map0(v_c_feat_fp32, curv=c_fp32) # 将组合视觉特征映射到双曲
+                v_c_hyp = exp_map0(v_c_feat_fp32, curv=c_fp32) 
 
                 t_v_hyp_all = exp_map0(verb_text_fp32, curv=c_fp32)
                 t_o_hyp_all = exp_map0(obj_text_fp32, curv=c_fp32)
@@ -210,12 +213,12 @@ class CustomCLIP(nn.Module):
                 verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
                 obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
 
-                temp = F.softplus(self.cls_temp) + 0.05
+                # 【执行优化 3：让温度系数稍微大一点，提升基础分类的鲁棒性】
+                temp = F.softplus(self.cls_temp) + 0.1 
                 verb_logits = -verb_dist / temp
                 obj_logits = -obj_dist / temp
 
             if self.training:
-                # 【核心修正 5】：在训练阶段专门提取当前 Batch 对应的组合文本特征 t_c
                 batch_comp_tokens = self.comp_tokens[pairs]
                 with torch.no_grad():
                     batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
@@ -223,7 +226,7 @@ class CustomCLIP(nn.Module):
                 batch_comp_text_features = self.c2c_text_c(batch_comp_text_features)
 
                 with torch.cuda.amp.autocast(enabled=False):
-                    t_c_feat_fp32 = batch_comp_text_features.float() * self.text_scale.float()
+                    t_c_feat_fp32 = clip_by_norm(batch_comp_text_features.float() * self.text_scale.float(), MAX_R)
                     t_c_hyp_batch = exp_map0(t_c_feat_fp32, curv=c_fp32)
 
                 t_v_hyp_batch = t_v_hyp_all[batch_verb]
@@ -237,18 +240,28 @@ class CustomCLIP(nn.Module):
                     'obj_logits': obj_logits,
                     'v_hyp': v_hyp,
                     'o_hyp': o_hyp,
-                    'v_c_hyp': v_c_hyp,           # 传出 v_c，用于 HEM Loss
+                    'v_c_hyp': v_c_hyp,           
                     't_v_hyp': t_v_hyp_batch,
                     't_o_hyp': t_o_hyp_batch,
-                    't_c_hyp': t_c_hyp_batch,     # 传出 t_c，用于 HEM Loss
+                    't_c_hyp': t_c_hyp_batch,     
                     'coarse_v_hyp': coarse_v_hyp_batch,
                     'coarse_o_hyp': coarse_o_hyp_batch
                 }
                 return predict
             else:
-                verb_prob = torch.softmax(verb_logits, dim=-1)
-                obj_prob = torch.softmax(obj_logits, dim=-1)
-                pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)
+                # =========================================================
+                # 【终极优化 1】：废除导致双曲 AUC 排序崩溃的 Softmax！
+                # 欧氏用了线性缩放 * 0.5 + 0.5 来维持平滑概率，
+                # 在双曲空间，最科学的做法是直接将 Logits（负距离）相加！
+                # 这等价于计算动词和物品特征距离和的最小化（能量模型）
+                # =========================================================
+                # 之前错误的代码：
+                # verb_prob = torch.softmax(verb_logits, dim=-1)
+                # obj_prob = torch.softmax(obj_logits, dim=-1)
+                # pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)
+                
+                # 现在正确的代码（Logits 直接相加）：
+                pred_com = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
 
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
                 com_logits = pred_com[:, verb_idx, obj_idx]
@@ -259,33 +272,27 @@ class CustomCLIP(nn.Module):
             # 【纯欧式逻辑】：严格还原 eur_c2c (不走 exp_map0)
             # ----------------------------------------------------
             with torch.cuda.amp.autocast(enabled=False):
-                # 1. 严格使用 L2 归一化 (复刻 eur_c2c)
                 o_feat_normed = F.normalize(o_feat.float(), dim=1)
                 v_feat_normed = F.normalize(v_feat.float(), dim=1)
 
                 verb_text_features_norm = F.normalize(verb_text_features.float(), dim=-1)
                 obj_text_features_norm = F.normalize(obj_text_features.float(), dim=-1)
 
-                # 2. 纯欧式内积计算 logits (不除以 temperature)
                 verb_logits_euc = v_feat_normed @ verb_text_features_norm.t()
                 obj_logits_euc = o_feat_normed @ obj_text_features_norm.t()
 
-                # 3. 欧式专属的概率平移 (* 0.5 + 0.5)
                 verb_logits_euc = verb_logits_euc * 0.5 + 0.5
                 obj_logits_euc = obj_logits_euc * 0.5 + 0.5
 
-                # 4. 外积得到组合预测矩阵 [Batch, N_verb, N_obj]
                 pred_com_euc = torch.einsum('bi,bj->bij', verb_logits_euc, obj_logits_euc)
 
             if self.training:
-                # 训练阶段：构造欧式专属字典，传给 train_models.py 里的欧式分支
                 return {
                     'verb_logits_euc': verb_logits_euc,
                     'obj_logits_euc': obj_logits_euc,
                     'pred_com_euc': pred_com_euc
                 }
             else:
-                # 测试阶段：利用 pairs 索引出对应的组合概率
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
                 com_logits_euc = pred_com_euc[:, verb_idx, obj_idx]
                 return com_logits_euc
