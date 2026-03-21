@@ -1,3 +1,4 @@
+
 import torch
 import torch.nn as nn
 from clip import clip
@@ -11,8 +12,7 @@ from utils.lorentz import exp_map0, pairwise_dist
 _tokenizer = _Tokenizer()
 
 # =====================================================================
-# 【终极优化 2】：补充丢失的防爆核心！最大模长裁剪 (Norm Clipping)
-# 缺少这个，特征会撞击双曲圆盘边缘，导致梯度消失和基础分类崩溃！
+# 最大模长裁剪 (Norm Clipping)：防止特征撞击双曲圆盘边缘导致梯度消失
 # =====================================================================
 def clip_by_norm(x, max_norm=5.0): 
     norm = torch.norm(x, dim=-1, keepdim=True)
@@ -191,7 +191,7 @@ class CustomCLIP(nn.Module):
             with torch.cuda.amp.autocast(enabled=False):
                 c_fp32 = c_pos.float()
                 
-                # 【执行优化 2：特征必须先裁剪再映射，否则边缘效应会导致梯度锁死！】
+                # 特征裁剪，防止溢出
                 o_feat_fp32 = clip_by_norm(o_feat.float() * self.visual_scale.float(), MAX_R)
                 v_feat_fp32 = clip_by_norm(v_feat.float() * self.visual_scale.float(), MAX_R)
                 v_c_feat_fp32 = clip_by_norm(v_c_feat.float() * self.visual_scale.float(), MAX_R)
@@ -201,6 +201,7 @@ class CustomCLIP(nn.Module):
                 coarse_verb_fp32 = clip_by_norm(coarse_verb_features.float() * self.text_scale.float(), MAX_R)
                 coarse_obj_fp32 = clip_by_norm(coarse_obj_features.float() * self.text_scale.float(), MAX_R)
 
+                # 指数映射到双曲流形
                 o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
                 v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
                 v_c_hyp = exp_map0(v_c_feat_fp32, curv=c_fp32) 
@@ -210,15 +211,21 @@ class CustomCLIP(nn.Module):
                 coarse_v_hyp_all = exp_map0(coarse_verb_fp32, curv=c_fp32)
                 coarse_o_hyp_all = exp_map0(coarse_obj_fp32, curv=c_fp32)
 
+                # 计算双曲测地距离
                 verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
                 obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
 
-                # 【执行优化 3：让温度系数稍微大一点，提升基础分类的鲁棒性】
+                # 计算独立组件的 Logits
                 temp = F.softplus(self.cls_temp) + 0.1 
                 verb_logits = -verb_dist / temp
                 obj_logits = -obj_dist / temp
 
+                # 【终极修正核心】：统一在此处计算联合预测概率 (Logits相加取代Softmax乘法)
+                # 这样 loss.py 才能在训练阶段接收到梯度！
+                pred_com_logits = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
+
             if self.training:
+                # 提取当前 batch 需要的全局文本组合特征，用于 DAL
                 batch_comp_tokens = self.comp_tokens[pairs]
                 with torch.no_grad():
                     batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
@@ -238,6 +245,7 @@ class CustomCLIP(nn.Module):
                     'c_pos': c_pos,
                     'verb_logits': verb_logits,
                     'obj_logits': obj_logits,
+                    'pred_com_logits': pred_com_logits,  # 成功传出！告别 com_loss = 0
                     'v_hyp': v_hyp,
                     'o_hyp': o_hyp,
                     'v_c_hyp': v_c_hyp,           
@@ -249,22 +257,9 @@ class CustomCLIP(nn.Module):
                 }
                 return predict
             else:
-                # =========================================================
-                # 【终极优化 1】：废除导致双曲 AUC 排序崩溃的 Softmax！
-                # 欧氏用了线性缩放 * 0.5 + 0.5 来维持平滑概率，
-                # 在双曲空间，最科学的做法是直接将 Logits（负距离）相加！
-                # 这等价于计算动词和物品特征距离和的最小化（能量模型）
-                # =========================================================
-                # 之前错误的代码：
-                # verb_prob = torch.softmax(verb_logits, dim=-1)
-                # obj_prob = torch.softmax(obj_logits, dim=-1)
-                # pred_com = verb_prob.unsqueeze(2) * obj_prob.unsqueeze(1)
-                
-                # 现在正确的代码（Logits 直接相加）：
-                pred_com = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
-
+                # 推理阶段直接使用外积算好的矩阵，按对(pairs)索引返回
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
-                com_logits = pred_com[:, verb_idx, obj_idx]
+                com_logits = pred_com_logits[:, verb_idx, obj_idx]
                 return com_logits
 
         else:
