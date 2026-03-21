@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 from clip import clip
@@ -12,7 +11,7 @@ from utils.lorentz import exp_map0, pairwise_dist
 _tokenizer = _Tokenizer()
 
 # =====================================================================
-# 最大模长裁剪 (Norm Clipping)：防止特征撞击双曲圆盘边缘导致梯度消失
+# 防爆限制机制，防止撞击双曲边界
 # =====================================================================
 def clip_by_norm(x, max_norm=5.0): 
     norm = torch.norm(x, dim=-1, keepdim=True)
@@ -191,7 +190,7 @@ class CustomCLIP(nn.Module):
             with torch.cuda.amp.autocast(enabled=False):
                 c_fp32 = c_pos.float()
                 
-                # 特征裁剪，防止溢出
+                # 裁断模长，防止溢出
                 o_feat_fp32 = clip_by_norm(o_feat.float() * self.visual_scale.float(), MAX_R)
                 v_feat_fp32 = clip_by_norm(v_feat.float() * self.visual_scale.float(), MAX_R)
                 v_c_feat_fp32 = clip_by_norm(v_c_feat.float() * self.visual_scale.float(), MAX_R)
@@ -201,7 +200,6 @@ class CustomCLIP(nn.Module):
                 coarse_verb_fp32 = clip_by_norm(coarse_verb_features.float() * self.text_scale.float(), MAX_R)
                 coarse_obj_fp32 = clip_by_norm(coarse_obj_features.float() * self.text_scale.float(), MAX_R)
 
-                # 指数映射到双曲流形
                 o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
                 v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
                 v_c_hyp = exp_map0(v_c_feat_fp32, curv=c_fp32) 
@@ -211,21 +209,17 @@ class CustomCLIP(nn.Module):
                 coarse_v_hyp_all = exp_map0(coarse_verb_fp32, curv=c_fp32)
                 coarse_o_hyp_all = exp_map0(coarse_obj_fp32, curv=c_fp32)
 
-                # 计算双曲测地距离
                 verb_dist = pairwise_dist(v_hyp, t_v_hyp_all, curv=c_fp32)
                 obj_dist = pairwise_dist(o_hyp, t_o_hyp_all, curv=c_fp32)
 
-                # 计算独立组件的 Logits
                 temp = F.softplus(self.cls_temp) + 0.1 
                 verb_logits = -verb_dist / temp
                 obj_logits = -obj_dist / temp
 
-                # 【终极修正核心】：统一在此处计算联合预测概率 (Logits相加取代Softmax乘法)
-                # 这样 loss.py 才能在训练阶段接收到梯度！
+                # 废除 Softmax，直接使用 Logits 相加，作为联合推理概率
                 pred_com_logits = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
 
             if self.training:
-                # 提取当前 batch 需要的全局文本组合特征，用于 DAL
                 batch_comp_tokens = self.comp_tokens[pairs]
                 with torch.no_grad():
                     batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
@@ -245,7 +239,7 @@ class CustomCLIP(nn.Module):
                     'c_pos': c_pos,
                     'verb_logits': verb_logits,
                     'obj_logits': obj_logits,
-                    'pred_com_logits': pred_com_logits,  # 成功传出！告别 com_loss = 0
+                    'pred_com_logits': pred_com_logits,  # 确保传出供隐式监督
                     'v_hyp': v_hyp,
                     'o_hyp': o_hyp,
                     'v_c_hyp': v_c_hyp,           
@@ -257,14 +251,13 @@ class CustomCLIP(nn.Module):
                 }
                 return predict
             else:
-                # 推理阶段直接使用外积算好的矩阵，按对(pairs)索引返回
                 verb_idx, obj_idx = pairs[:, 0], pairs[:, 1]
                 com_logits = pred_com_logits[:, verb_idx, obj_idx]
                 return com_logits
 
         else:
             # ----------------------------------------------------
-            # 【纯欧式逻辑】：严格还原 eur_c2c (不走 exp_map0)
+            # 【纯欧式逻辑】：严格还原 eur_c2c (完整代码)
             # ----------------------------------------------------
             with torch.cuda.amp.autocast(enabled=False):
                 o_feat_normed = F.normalize(o_feat.float(), dim=1)
