@@ -112,7 +112,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
     attr2idx = train_dataset.attr2idx
     obj2idx = train_dataset.obj2idx
 
-    # 将 train_pairs 注入 config，供 loss.py 里的组合损失使用！
+    # 将 train_pairs 注入 config，极其重要，供 loss_com 难负例挖掘使用！
     train_pairs = torch.tensor([(attr2idx[attr], obj2idx[obj])
                                 for attr, obj in train_dataset.train_pairs]).cuda()
     config.train_pairs = train_pairs 
@@ -128,7 +128,6 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         epoch_train_losses = []
         epoch_cls_v_losses = []
         epoch_cls_o_losses = []
-        epoch_dal_losses = []
         epoch_hem_losses = []
         epoch_com_losses = []
 
@@ -164,9 +163,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     loss, loss_dict = loss_calu(predict, target, config)
                     loss = loss / config.gradient_accumulation_steps
 
-                    epoch_dal_losses.append(loss_dict.get('loss_dal', 0.0))
                     epoch_hem_losses.append(loss_dict.get('loss_hem', 0.0))
-                    # 【加回来！】记录双曲分支下的 loss_com
                     epoch_com_losses.append(loss_dict.get('loss_com', 0.0))
 
                 else:
@@ -216,8 +213,7 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
                     "loss": f"{np.mean(epoch_train_losses[-50:]):.2f}",
                     "v_cls": f"{np.mean(epoch_cls_v_losses[-50:]):.2f}",
                     "o_cls": f"{np.mean(epoch_cls_o_losses[-50:]):.2f}",
-                    "com": f"{np.mean(epoch_com_losses[-50:]):.2f}", # 【加回来！】进度条打印
-                    "dal": f"{np.mean(epoch_dal_losses[-50:]):.2f}",
+                    "com": f"{np.mean(epoch_com_losses[-50:]):.2f}",
                     "hem": f"{np.mean(epoch_hem_losses[-50:]):.2f}",
                     "c": f"{current_c:.3f}",
                     "tau": f"{current_temp:.3f}"
@@ -242,11 +238,9 @@ def c2c_vanilla(model, optimizer, lr_scheduler, config, train_dataset, val_datas
         log_training.write(f"epoch {i + 1} train loss {np.mean(epoch_train_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_verb loss {np.mean(epoch_cls_v_losses):.4f}\n")
         log_training.write(f"epoch {i + 1} cls_obj loss {np.mean(epoch_cls_o_losses):.4f}\n")
-        # 【加回来！】统一写入 log
         log_training.write(f"epoch {i + 1} com loss {np.mean(epoch_com_losses):.4f}\n")
 
         if use_hyperbolic:
-            log_training.write(f"epoch {i + 1} dal loss {np.mean(epoch_dal_losses):.4f}\n")
             log_training.write(f"epoch {i + 1} hem loss {np.mean(epoch_hem_losses):.4f}\n")
 
         if (i + 1) % config.save_every_n == 0:
