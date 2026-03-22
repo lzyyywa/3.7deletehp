@@ -74,8 +74,9 @@ train:
   w_cls: 0.2   #动词/物品分类损失权重
   w_com: 1.0
   w_dal: 1.0   #判别对齐损失权重
-  w_hem: 0.1   #层次蕴含  
-  use_hyperbolic: False
+  w_hem: 1.0   #层次蕴含  
+  hard_weight: 3.0 
+  use_hyperbolic: True
 
 test:
   eval_batch_size: 32
