@@ -11,7 +11,7 @@ from utils.lorentz import exp_map0, pairwise_dist
 _tokenizer = _Tokenizer()
 
 # =====================================================================
-# 防爆限制机制，防止撞击双曲边界
+# 防爆限制机制：防止特征撞击庞加莱圆盘边缘导致梯度消失
 # =====================================================================
 def clip_by_norm(x, max_norm=5.0): 
     norm = torch.norm(x, dim=-1, keepdim=True)
@@ -144,8 +144,8 @@ class CustomCLIP(nn.Module):
 
         self.c2c_OE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
         self.c2c_VE1 = MLP_ST(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
-        self.c2c_CE1 = MLP(cfg.feat_dim, int(cfg.emb_dim), relu=cfg.relu, num_layers=cfg.nlayers, dropout=False, norm=True, layers=layers)
-
+        
+        # 彻底废除 c2c_CE1 全局视觉 MLP 及其投影层！
         self.c2c_text_v = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_o = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
         self.c2c_text_c = nn.Linear(cfg.feat_dim, cfg.emb_dim, bias=True)
@@ -180,21 +180,18 @@ class CustomCLIP(nn.Module):
         v_feat_t = self.c2c_VE1(video_features)
         v_feat = v_feat_t.mean(dim=-1)
 
-        v_c_feat = self.c2c_CE1(video_features.mean(dim=-1))
+        # 废除提取 v_c_feat！
 
-        # ==================== [逻辑分流] ====================
         if self.use_hyperbolic:
             c_pos = torch.clamp(F.softplus(self.c), min=0.5)
-            MAX_R = 5.0 # 防爆半径
+            MAX_R = 5.0
 
             with torch.cuda.amp.autocast(enabled=False):
                 c_fp32 = c_pos.float()
                 
-                # 裁断模长，防止溢出
                 o_feat_fp32 = clip_by_norm(o_feat.float() * self.visual_scale.float(), MAX_R)
                 v_feat_fp32 = clip_by_norm(v_feat.float() * self.visual_scale.float(), MAX_R)
-                v_c_feat_fp32 = clip_by_norm(v_c_feat.float() * self.visual_scale.float(), MAX_R)
-
+                
                 verb_text_fp32 = clip_by_norm(verb_text_features.float() * self.text_scale.float(), MAX_R)
                 obj_text_fp32 = clip_by_norm(obj_text_features.float() * self.text_scale.float(), MAX_R)
                 coarse_verb_fp32 = clip_by_norm(coarse_verb_features.float() * self.text_scale.float(), MAX_R)
@@ -202,8 +199,7 @@ class CustomCLIP(nn.Module):
 
                 o_hyp = exp_map0(o_feat_fp32, curv=c_fp32)
                 v_hyp = exp_map0(v_feat_fp32, curv=c_fp32)
-                v_c_hyp = exp_map0(v_c_feat_fp32, curv=c_fp32) 
-
+                
                 t_v_hyp_all = exp_map0(verb_text_fp32, curv=c_fp32)
                 t_o_hyp_all = exp_map0(obj_text_fp32, curv=c_fp32)
                 coarse_v_hyp_all = exp_map0(coarse_verb_fp32, curv=c_fp32)
@@ -216,10 +212,11 @@ class CustomCLIP(nn.Module):
                 verb_logits = -verb_dist / temp
                 obj_logits = -obj_dist / temp
 
-                # 废除 Softmax，直接使用 Logits 相加，作为联合推理概率
+                # 【极其核心】：无参数联合推理叠加！
                 pred_com_logits = verb_logits.unsqueeze(2) + obj_logits.unsqueeze(1)
 
             if self.training:
+                # 仅提取全局文本组合特征（用来给纯净的文本建树使用）
                 batch_comp_tokens = self.comp_tokens[pairs]
                 with torch.no_grad():
                     batch_comp_emb = self.token_embedding(batch_comp_tokens).type(self.text_encoder.dtype)
@@ -239,10 +236,10 @@ class CustomCLIP(nn.Module):
                     'c_pos': c_pos,
                     'verb_logits': verb_logits,
                     'obj_logits': obj_logits,
-                    'pred_com_logits': pred_com_logits,  # 确保传出供隐式监督
+                    'pred_com_logits': pred_com_logits,
                     'v_hyp': v_hyp,
                     'o_hyp': o_hyp,
-                    'v_c_hyp': v_c_hyp,           
+                    # v_c_hyp 已经光荣退役
                     't_v_hyp': t_v_hyp_batch,
                     't_o_hyp': t_o_hyp_batch,
                     't_c_hyp': t_c_hyp_batch,     
@@ -256,9 +253,6 @@ class CustomCLIP(nn.Module):
                 return com_logits
 
         else:
-            # ----------------------------------------------------
-            # 【纯欧式逻辑】：严格还原 eur_c2c (完整代码)
-            # ----------------------------------------------------
             with torch.cuda.amp.autocast(enabled=False):
                 o_feat_normed = F.normalize(o_feat.float(), dim=1)
                 v_feat_normed = F.normalize(v_feat.float(), dim=1)
